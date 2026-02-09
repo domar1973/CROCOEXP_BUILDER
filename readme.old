@@ -1,0 +1,103 @@
+#
+# CROCO_EXPERIMENTS
+#
+# Universidad Nacional de Tierra del Fuego - 2026
+#
+Para correr los experimentos se construye una imagen docker con todos los paquetes necesarios
+para compilar y correr croco. Al correr un contenedor se monta la carpeta del experimento. Se puede compilar y
+ejecutar desde el contenedor, y lo que se haga quedará persistente en la carpeta.
+Los archivos de configuración y salida pueden manejarse perfectamente desde el host.
+
+Instrucciones:
+Si estás leyendo esto, ya descomprimiste el tar.
+Si no tenés Docker instalado, instalalo ahora.
+
+1) Desde la carpeta donde está este readme, correr
+> ./deploy.sh
+(esto se hace solo una vez. Esto construye la imagen y el script que la ejecuta)
+
+2) Crea un experimento con create_exp.sh
+> ./create_exp.sh [nombredelexperimento]
+Eso crea la carpeta "nombredelexperimento" con las subcarpetas necesarias.
+
+3) Para correr el contenedor, en la carpeta CROCO_EXPERIMENTS ejecuta
+> ./run.sh
+Esto va a abrir una sesión interactiva de linea de comando, montando
+la carpeta CROCO_EXPERIMENTS. Una vez en el contenedor, hacé
+> cd CROCO_EXPERIMENTS
+> source setup.sh
+> cd [nombredelexperimento]
+
+4) Configura el experimento. Recomendaciones:
+
+   - Tener una segunda pestana de la terminal en la carpeta montada en el host, para manipular con comodidad.
+     Esto permite además manejar docker ps, docker stop, etc.
+
+   - Modificar los headers y los forzantes de acuerdo al experimento que se desee hacer.
+
+   - Para correr croco, aún es necesario compilar usando jobcomp (CROCO_EXPERIMENTS/[nombredelexperimento]/build/jobcomp).
+   
+5) Arquitectura:
+
+/opt/CROCO_EXPERIMENTS
+├── setup.sh
+├── jobcomp                 # launcher (elige experimento)
+├── croco-v2.1.2/            # distro CROCO (intocable)
+└── experiments/
+    └── EXP_A/
+        ├── headers/         # cppdefs.h, param.h, *.h, *.h90
+        ├── src/             # overrides *.F / *.F90 (si aplica)
+        ├── make/            # Make* / Makedefs* (si aplica)
+        ├── croco.in         # namelist del experimento (si aplica)
+        ├── jobcomp          # compila ESTE experimento
+        ├── build/           # generado
+        └── LOG/             # generado
+
+
+
+
+
+
+______EL VIEJO (borrar una vez que el otro ande)_______
+
+CROCO_EXPERIMENTS/
+├──croco-va.b.c/
+│  └──[source code]
+├──croco-vd.e.f/
+│  └──[source code]
+├──...
+├──create_experiment.sh
+├──run.sh
+└──EXPERIMENTS/
+   ├──[nombredelexperimento]/
+   │  ├── README.md
+   │  ├── EXP/              ← corazón del experimento
+   │  │   ├── cppdefs.h
+   │  │   ├── param.h
+   │  │   ├── analytical.F
+   │  │   ├── jobcomp
+   │  │   └── croco.in
+   │  │
+   │  ├── GRD/              ← grillas
+   │  │   └── grid.nc
+   │  │
+   │  ├── FORC/             ← forzamientos (vacío al principio)
+   │  │
+   │  ├── INIT/             ← condiciones iniciales (si no son analíticas)
+   │  │
+   │  ├── OUT/              ← salidas del modelo
+   │  │
+   │  ├── LOG/              ← logs de ejecución
+   │  │
+   │  └── build/            ← compilación local
+   ├──[otro_experimento]/
+   │  ├── ...
+   ...
+   
+6) Actualizar CROCO
+
+    6.1- Para incluir una versión de CROCO, copiar la carpeta completa dentro de CROCO_EXPERIMENTS.
+         Esa carpeta no se modificará.
+         
+    6.2- Para usar una versión determinada, dale el nombre de la carpeta croco a la variable
+         version en setup.sh

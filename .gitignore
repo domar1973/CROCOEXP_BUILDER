@@ -1,0 +1,26 @@
+# CROCO distros (no versionar)
+CROCO_EXPERIMENTS/croco-v*/
+
+# Generated build/runtime artifacts
+**/build/*
+**/OUT/*
+**/LOG/*
+**/*.o
+**/*.a
+**/*.mod
+
+# Big / binary / netcdf outputs
+**/*.nc
+**/*.cdf
+**/*.grd
+**/*.rst
+**/*.his
+**/*.avg
+**/*.dia
+
+# OS / editor
+.DS_Store
+*.swp
+*~
+.vscode/
+.idea/
