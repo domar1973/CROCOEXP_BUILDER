@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+import argparse
+import sys
+
+from crocoexp_lib import cmd_compile, cmd_import, cmd_inspect
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="crocoexp",
+        description="Host-side CROCO experiment builder commands.",
+    )
+    parser.add_argument(
+        "--experiments-root",
+        default="CROCO_EXPERIMENTS",
+        help="Path to the CROCO_EXPERIMENTS directory.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    import_p = sub.add_parser("import", help="Register and analyze an experiment input/ folder.")
+    import_p.add_argument("experiment_name")
+    import_p.add_argument("--json", action="store_true", help="Print machine-readable summary.")
+
+    inspect_p = sub.add_parser("inspect", help="Show manifest summary.")
+    inspect_p.add_argument("experiment_name")
+    inspect_p.add_argument("--json", action="store_true", help="Print machine-readable summary.")
+
+    compile_p = sub.add_parser("compile", help="Attempt CROCO compilation through Docker.")
+    compile_p.add_argument("experiment_name")
+    compile_p.add_argument(
+        "--image",
+        default="domarcroco/images-for-croco:base_croco_msot-1.0.0",
+        help="Docker image used as the CROCO execution backend.",
+    )
+    compile_p.add_argument("--jobs", default="1", help="Compilation parallelism passed to jobcomp.")
+    compile_p.add_argument("--json", action="store_true", help="Print machine-readable summary.")
+
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.command == "import":
+        return cmd_import(args)
+    if args.command == "inspect":
+        return cmd_inspect(args)
+    if args.command == "compile":
+        return cmd_compile(args)
+    parser.error(f"unknown command {args.command}")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

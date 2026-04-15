@@ -7,7 +7,7 @@
 It is **not** a new ocean model, nor a wrapper that hides CROCO. On the contrary:
 
 > CROCO is best understood as a **highly structured scientific code library**.
->
+> 
 > A “CROCO model” only exists *after* a research team selects a set of compile-time directives, parameter files, and workflows that together define a specific experiment.
 
 This repository exists to make that process **explicit, reproducible, and debuggable**.
@@ -45,30 +45,37 @@ Only (2) lives in this repository.
 This is the *minimal* path from zero to a running experiment:
 
 1. **One-time setup**
+   
    ```bash
-   ./setup.sh
+   source setup.sh
    ```
+   
    Prepares the local environment and verifies basic dependencies.
 
 2. **Create a new experiment**
+   
    ```bash
    ./create_experiment.sh EXP_MY_FIRST_CASE
    ```
+   
    This copies a canonical template experiment and gives you a clean, isolated workspace.
 
 3. **Adjust the experiment configuration**
+   
    - compilation directives
    - parameter files
    - forcing / grid paths
-
+   
    (You may do this manually, or with the help of the GPT copiloto.)
 
 4. **Compile the experiment**
+   
    ```bash
    ./compile_experiment.sh EXP_MY_FIRST_CASE
    ```
 
 5. **Run the experiment**
+   
    ```bash
    ./run_experiment.sh EXP_MY_FIRST_CASE
    ```
@@ -167,4 +174,3 @@ If you are looking for a “one-click ocean simulator”, this is not it.
 This project is under active development and intended for **community use within research teams**.
 
 Contributions, discussion, and careful skepticism are welcome.
-

@@ -9,7 +9,7 @@
 ##
 ## Daniel Badagnani,               Monica Manceñido
 ## dbadagnani@untdf.edu.ar         yavamoni@gmail.com
-## 
+##
 #######################################################
 
 # Root del árbol CROCO_EXPERIMENTS (donde está este setup.sh)

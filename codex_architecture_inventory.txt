@@ -1,0 +1,219 @@
+• Short Diagnosis
+
+  The builder currently mixes three concerns that should stay separate: experiment identity, CROCO compile-time configuration, and runtime input validation. Host-side
+  Docker entry is simple and usable, but the in-container scripts assume a single “regional NetCDF-input” experiment shape. That makes idealized or analytical cases
+  like BASIN fail before CROCO gets a chance to run.
+
+  The clearest bug class is in CROCO_EXPERIMENTS/run_experiment.sh:134: it always requires GRD_FILE, INI_FILE, and FRC_FILE, then always validates GRD/, INIT/, and
+  FORC/ files at CROCO_EXPERIMENTS/run_experiment.sh:185. BASIN-style CROCO cases can define analytical grid, initial state, and forcing in cppdefs.h, including
+  ANA_GRID, ANA_INITIAL, ANA_SMFLUX, ANA_STFLUX, and NO_FRCFILE, as seen in CROCO_EXPERIMENTS/experiments/EXP_SMOKE_TEST/EXP/cppdefs.h:657. Those cases do not
+  necessarily have, or need, grid.nc, ini.nc, or forc.nc.
+
+  There is also a version-format mismatch: CROCO_EXPERIMENTS/create_experiment.sh:103 expects old TITLE ==, GRDNAME ==, ININAME ==, FRCNAME == style keys, but the
+  current v2.1.2 template uses sections like title:, grid: filename, and forcing: filename, as shown in CROCO_EXPERIMENTS/experiments/BASIN/EXP/croco.in.template:1. So
+  the renderer may replace variables that are not actually present in the template.
+
+  Dependency Graph
+
+  Host
+    deploy.sh
+      -> checks docker
+      -> optionally docker pull image
+      -> generates run.sh
+    run.sh
+      -> docker run
+      -> mounts ./CROCO_EXPERIMENTS as /opt/CROCO_EXPERIMENTS
+      -> opens /bin/bash in container
+
+  Container, under /opt/CROCO_EXPERIMENTS
+    setup.sh
+      -> exports CROCOEXP_HOME
+      -> exports version=croco-v2.1.2
+      -> exports CROCOEXP_EXPERIMENTS_DIR
+
+    create_experiment.sh EXP
+      -> source setup.sh
+      -> copy experiments/001_TEMPLATE_EXPERIMENT
+      -> copy croco-v2.1.2/OCEAN/{cppdefs.h,param.h,analytical.F,croco.in}
+      -> generate EXP/run.env
+      -> attempt to template croco.in
+
+    compile_experiment.sh EXP
+      -> source setup.sh
+      -> locate experiments/EXP/EXP
+      -> create experiments/EXP/croco -> croco-v2.1.2 symlink
+      -> rsync EXP/ into build/
+      -> copy croco-v2.1.2/OCEAN/jobcomp into build/
+      -> set compiler and NetCDF env
+      -> patch copied jobcomp if nf-config is missing
+      -> cd build && ./jobcomp
+
+    build/jobcomp
+      -> expects SOURCE1=../croco/OCEAN
+      -> copies CROCO source into build/Compile
+      -> overlays local build/*.F, *.h, Make*
+      -> detects CPP options via testkeys.F
+      -> make depend
+      -> make
+      -> emits build/croco, build/partit, build/ncjoin
+
+    run_experiment.sh EXP
+      -> source setup.sh
+      -> require experiments/EXP/build/croco
+      -> source EXP/run.env
+      -> render croco.in.template into OUT/run_*/croco.in
+      -> symlink GRD INIT FORC if directories exist
+      -> validate fixed input files
+      -> snapshot config
+      -> run croco serial or via MPI launcher
+
+  Key file anchors:
+
+  - Docker host entry: run.sh:21
+  - Canonical generated Docker entry includes UID/HOME handling: deploy.sh:124
+  - CROCO version and experiment root: CROCO_EXPERIMENTS/setup.sh:16
+  - Compile staging and official jobcomp: CROCO_EXPERIMENTS/compile_experiment.sh:85
+  - Official jobcomp source and overlay behavior: CROCO_EXPERIMENTS/croco-v2.1.2/OCEAN/jobcomp:183 and CROCO_EXPERIMENTS/croco-v2.1.2/OCEAN/jobcomp:220
+  - Runtime fixed validation: CROCO_EXPERIMENTS/run_experiment.sh:134 and CROCO_EXPERIMENTS/run_experiment.sh:185
+
+  Compile Contract
+
+  Current compile contract:
+
+  - Must run inside the Docker image or an equivalent CROCO-capable environment. Codex does not need to run inside Docker.
+  - CROCO_EXPERIMENTS/setup.sh must define CROCOEXP_HOME, version, and CROCOEXP_EXPERIMENTS_DIR.
+  - Experiment path is experiments/<EXP_NAME>/.
+  - Compile overrides live in experiments/<EXP_NAME>/EXP/.
+  - Build output lives in experiments/<EXP_NAME>/build/.
+  - compile_experiment.sh stages EXP/ into build/, then copies the official CROCO OCEAN/jobcomp.
+  - The official jobcomp expects ../croco/OCEAN, so compile_experiment.sh creates experiments/<EXP_NAME>/croco -> ${CROCOEXP_HOME}/${version}.
+  - cppdefs.h, param.h, and analytical.F are compile-time contract files.
+  - build/croco is the runtime executable contract.
+  - Compiler/NetCDF assumptions are environment driven but currently default to hardcoded Intel NetCDF paths in CROCO_EXPERIMENTS/compile_experiment.sh:101.
+
+  Runtime Contract
+
+  Current runtime contract:
+
+  - Experiment must already have build/croco.
+  - Runtime config is EXP/run.env.
+  - Runtime template is EXP/croco.in.template.
+  - Output run directory is experiments/<EXP>/OUT/run_<timestamp>[_tag].
+  - GRD, INIT, and FORC directories are symlinked into each run directory if present.
+  - Rendered croco.in is written into the run directory.
+  - Config snapshot copies run.env, template, rendered croco.in, cppdefs.h, and param.h.
+  - Execution is either serial: croco croco.in, or MPI: <launcher> -np <N> croco croco.in.
+
+  The problem is that this runtime contract is not profile-aware. It treats all experiments as regional file-backed runs.
+
+  Invariants To Preserve
+
+  - Docker remains the execution backend.
+  - Host wrappers remain stable and do not assume the caller is inside Docker.
+  - No Codex installation or runtime dependency belongs in the container.
+  - CROCO source trees remain read-only inputs.
+  - Each experiment remains self-contained under experiments/<EXP_NAME>/.
+  - Compile outputs remain isolated under experiments/<EXP_NAME>/build/.
+  - Runtime outputs remain isolated under experiments/<EXP_NAME>/OUT/run_*.
+  - Logs remain under experiments/<EXP_NAME>/LOG/.
+  - EXP/cppdefs.h, EXP/param.h, and EXP/analytical.F remain the compile-time truth for the effective CROCO model.
+  - build/croco must be produced from the staged experiment overrides, not by mutating the upstream CROCO tree.
+  - Runtime should snapshot the exact rendered input and compile-relevant files.
+  - Profile validation must fail early for genuinely missing required files, but must not invent requirements that the compiled experiment does not have.
+
+  Hardcoded Rigid Assumptions
+
+  - setup.sh pins one CROCO version: croco-v2.1.2 at CROCO_EXPERIMENTS/setup.sh:19.
+  - The Docker image is fixed unless regenerated by deploy.sh: run.sh:7.
+  - Runtime assumes GRD_FILE, INI_FILE, and FRC_FILE are always mandatory: CROCO_EXPERIMENTS/run_experiment.sh:134.
+  - Runtime assumes canonical input directories are always GRD, INIT, and FORC: CROCO_EXPERIMENTS/run_experiment.sh:139.
+  - Runtime assumes fixed file placement: GRD/<grid>, INIT/<ini>, FORC/<forc>: CROCO_EXPERIMENTS/run_experiment.sh:185.
+  - run.env generated by create_experiment.sh bakes in grid.nc, ini.nc, and forc.nc: CROCO_EXPERIMENTS/create_experiment.sh:142.
+  - Template rewriting assumes old CROCO input key names that do not match the current v2.1.2 croco.in format.
+  - Compile defaults assume Intel NetCDF paths under /opt/intel/...: CROCO_EXPERIMENTS/compile_experiment.sh:101.
+  - The checked-in run.sh:21 lacks the UID/HOME safeguards generated by deploy.sh:124, so root-owned output risk depends on whether deploy.sh has been rerun.
+
+  Failing Use-Cases Implied By Current Design
+
+  - BASIN or other analytical academic cases with ANA_GRID, ANA_INITIAL, and NO_FRCFILE but no NetCDF input files.
+  - BASIN-like cases where run.env comments out GRD_FILE, INI_FILE, and FRC_FILE, as in CROCO_EXPERIMENTS/experiments/EXP_SMOKE_TEST/EXP/run.env:15. These fail at
+    need_var.
+  - BASIN-like cases where the variables remain set to dummy values. These fail later because GRD/grid.nc, INIT/ini.nc, and FORC/forc.nc do not exist.
+  - Experiments using CROCO v2.1.2 input syntax, because the template generator is aimed at old KEY == value syntax but the actual template uses section blocks.
+  - Regional runs whose required files are not exactly one grid, one initial file, and one forcing file.
+  - Runs needing bulk_forcing, climatology, boundary files, diagnostics, XIOS XML, PISCES/MUSTANG namelists, or multiple forcing files.
+  - Compile profiles needing MPI, XIOS, OASIS, AGRIF, or non-default NetCDF/compiler settings as explicit experiment metadata rather than ambient shell variables.
+  - Multiple CROCO versions per experiment, because version is global rather than experiment-profile metadata.
+  - Experiments where runtime validation should inspect the rendered croco.in rather than fixed run.env variable names.
+
+  Why BASIN-Like Cases Are Rejected Incorrectly
+
+  There are two separate BASIN problems.
+
+  First, the current BASIN experiment is named BASIN but its cppdefs.h still has #undef BASIN and #define REGIONAL at CROCO_EXPERIMENTS/experiments/BASIN/EXP/
+  cppdefs.h:18 and CROCO_EXPERIMENTS/experiments/BASIN/EXP/cppdefs.h:56. So that folder is not currently a compiled BASIN profile unless edited.
+
+  Second, when BASIN is actually enabled, as in the untracked smoke experiment, cppdefs.h defines analytical sources and NO_FRCFILE: CROCO_EXPERIMENTS/experiments/
+  EXP_SMOKE_TEST/EXP/cppdefs.h:18 and CROCO_EXPERIMENTS/experiments/EXP_SMOKE_TEST/EXP/cppdefs.h:657. The runtime wrapper does not read or model that profile. It
+  rejects the run before execution because its validation is fixed to regional NetCDF files.
+
+  So BASIN is not being rejected by CROCO semantics. It is rejected by builder-side validation that is stricter than, and disconnected from, the compiled experiment.
+
+  Proposal
+
+  Separate experiment profile metadata from runtime file validation.
+
+  Introduce a small profile contract per experiment, for example EXP/profile.env or EXP/profile.yml, with fields like:
+
+  profile: academic_analytical
+  croco_version: croco-v2.1.2
+  compile:
+    cppdefs: cppdefs.h
+    param: param.h
+    analytical: analytical.F
+  runtime:
+    input_mode: analytical
+    template: croco.in.template
+    required_files: []
+    optional_files: []
+    render_strategy: croco_v2_section_template
+
+  For a regional NetCDF case:
+
+  profile: regional_netcdf
+  croco_version: croco-v2.1.2
+  runtime:
+    input_mode: file_backed
+    required_files:
+      - var: GRD_FILE
+        dir: GRD
+      - var: INI_FILE
+        dir: INIT
+      - var: FRC_FILE
+        dir: FORC
+    optional_files:
+      - var: CLM_FILE
+        dir: INIT
+      - var: BRY_FILE
+        dir: INIT
+      - var: TIDE_FILE
+        dir: FORC
+
+  Then change the conceptual contracts this way:
+
+  - run.env supplies run values, not experiment type.
+  - profile.* declares what kind of runtime validation applies.
+  - cppdefs.h remains compile truth, but the profile can be checked against obvious CPP signals like BASIN, REGIONAL, ANA_GRID, ANA_INITIAL, and NO_FRCFILE.
+  - run_experiment.sh validates through a profile-aware validator:
+      - analytical profile: do not require GRD_FILE, INI_FILE, FRC_FILE;
+      - regional profile: require declared files;
+      - mixed profiles: validate only files actually declared by the profile;
+      - optional files remain optional unless a profile or rendered input says they are active.
+  - Rendering should be CROCO-version-aware:
+      - old KEY == value templates use placeholder replacement;
+      - v2.1.2 section templates use section-aware replacement or explicit profile templates.
+  - create_experiment.sh should create a default regional profile, but academic templates like BASIN should create an analytical profile.
+  - Host-side Docker wrappers should stay boring: launch container, mount CROCO_EXPERIMENTS, set user/home safely. They should not contain experiment semantics.
+
+  No files were changed. I only inspected the repository.
+Token usage: total=95,601 input=86,906 (+ 612,224 cached) output=8,695 (reasoning 648)
