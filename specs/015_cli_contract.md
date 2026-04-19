@@ -41,6 +41,20 @@ CROCO_EXPERIMENTS/<experiment_name>/
       reports/
 ```
 
+Repo-level registered compile sources are stored separately from experiments:
+
+```text
+CROCO_EXPERIMENTS/sources/<source_id>/
+```
+
+Source registry state is stored under:
+
+```text
+.crocoexp/sources.json
+```
+
+Registered sources are compile infrastructure. They are not experiment `input/` evidence and are not selected by `crocoexp setup`.
+
 ### Docker mount policy
 
 Docker mounts the whole `CROCO_EXPERIMENTS` directory.
@@ -61,6 +75,7 @@ Commands that analyze artifacts should apply this reporting order:
 Infrastructural blockers include:
 
 - missing primary artifacts needed for the command
+- unknown or unavailable registered compile source when compiling
 - inability to write metadata or reports
 - inability to construct the requested staging/mounting plan
 - missing runtime assets classified as required for staging or mounting
@@ -87,6 +102,148 @@ Recommended exit codes:
 
 Exit code `5` is reserved for explicit strict behavior. It is not a default failure code for ambiguity, contradiction, suspicious combinations, or possible semantic mismatch.
 
+## `crocoexp source install <path> --id <source_id>`
+
+### Purpose
+
+Register a compile source tree by copying it into:
+
+```text
+CROCO_EXPERIMENTS/sources/<source_id>/
+```
+
+This command supports official CROCO source trees, MSOT, custom forks, and patched source trees. Source registration is about reproducible compile input provenance, not semantic validation of the source.
+
+### Minimal arguments
+
+- `<path>`: existing host path to the source tree to install.
+- `--id <source_id>`: stable identifier used by experiments.
+
+### Optional arguments
+
+- `--experiments-root <path>`
+- `--flavor <croco|msot|custom>`: declared source flavor.
+- `--declared-version <value>`: human-declared version or tag.
+- `--notes <text>`: human-readable notes.
+- `--force`: replace an existing registered source with the same `source_id`.
+- `--json`: emit machine-readable summary.
+
+### Expected generated files/directories
+
+May create or update:
+
+- `CROCO_EXPERIMENTS/sources/`
+- `CROCO_EXPERIMENTS/sources/<source_id>/`
+- `.crocoexp/sources.json`
+
+Must not modify experiment `input/` directories or experiment manifests.
+
+### Exit code behavior
+
+- `0`: source installed and registry written.
+- `2`: invalid CLI usage, missing `--id`, or invalid `source_id`.
+- `3`: origin source path is missing.
+- `4`: duplicate `source_id` without `--force`, source copy failure, or registry write failure.
+
+### Minimal user-visible diagnostics
+
+The command must print source id, origin path, installed host path, flavor, declared version, detected git branch/commit when practical, registry path, and any replacement warning from `--force`.
+
+### Docker usage
+
+Docker is not required. The command is host-side file management only.
+
+### Existing binary requirement
+
+No existing binary is required.
+
+### Write permissions
+
+May modify `CROCO_EXPERIMENTS/sources/` and `.crocoexp/sources.json`.
+
+Must not modify experiment `input/`, `metadata/`, `build/`, or `runs/`.
+
+## `crocoexp source list`
+
+### Purpose
+
+List registered compile source IDs and basic metadata.
+
+### Minimal arguments
+
+None.
+
+### Optional arguments
+
+- `--experiments-root <path>`
+- `--json`
+
+### Expected generated files/directories
+
+None. This command is read-only.
+
+### Exit code behavior
+
+- `0`: list completed. Empty registry is a successful result.
+- `4`: source registry is unreadable or malformed.
+
+### Minimal user-visible diagnostics
+
+The command must print source id, installed host path, flavor, declared version, and install timestamp.
+
+### Docker usage
+
+Docker is not used.
+
+### Existing binary requirement
+
+No existing binary is required.
+
+### Write permissions
+
+Read-only.
+
+## `crocoexp source inspect <source_id>`
+
+### Purpose
+
+Show detailed registry metadata for one registered compile source.
+
+### Minimal arguments
+
+- `<source_id>`
+
+### Optional arguments
+
+- `--experiments-root <path>`
+- `--json`
+
+### Expected generated files/directories
+
+None. This command is read-only.
+
+### Exit code behavior
+
+- `0`: source metadata was found and displayed.
+- `3`: `source_id` is not registered.
+- `4`: source registry is unreadable or malformed.
+
+### Minimal user-visible diagnostics
+
+The command must print source id, flavor, declared version, installed host path, origin path copied from, install timestamp, detected layout, git branch and commit when available, and content identity when practical.
+
+### Docker usage
+
+Docker is not used.
+
+### Existing binary requirement
+
+No existing binary is required.
+
+### Write permissions
+
+Read-only.
+
 ## Optional strict flags
 
 Future optional strict flags may include:
@@ -110,6 +267,8 @@ CROCO_EXPERIMENTS/<experiment_name>/input/
 
 Import creates generated metadata and the managed experiment structure outside `input/`. It does not create a named case profile and does not prove that the experiment will compile or run.
 
+When `--source <source_id>` is provided, import records the selected registered compile source under `compile_time.source_ref`. This is per-experiment traceability, not a global source/version setting.
+
 ### Minimal arguments
 
 - `<experiment_name>`: name of an existing directory under `CROCO_EXPERIMENTS/`.
@@ -117,6 +276,7 @@ Import creates generated metadata and the managed experiment structure outside `
 ### Optional arguments
 
 - `--experiments-root <path>`: defaults to `CROCO_EXPERIMENTS`.
+- `--source <source_id>`: select a registered compile source for this experiment.
 - `--force`: recompute generated metadata even if a manifest already exists.
 - `--override <path>`: host-side override file for resolving ambiguity.
 - `--json`: emit machine-readable summary.
@@ -140,7 +300,7 @@ Must not create or modify files inside `input/`.
 
 - `0`: import completed and manifest written, possibly with warnings.
 - `3`: `input/croco.in`, `input/cppdefs.h`, or `input/param.h` is missing.
-- `4`: artifact parsing, metadata writing, or report generation failed enough that the builder cannot record the import attempt.
+- `4`: artifact parsing, metadata writing, report generation, or `--source <source_id>` registry resolution failed enough that the builder cannot record the import attempt.
 - `5`: optional strict policy failed because warnings, ambiguity, contradiction, or possible semantic mismatch were found.
 
 ### Minimal user-visible diagnostics
@@ -150,6 +310,7 @@ The command must print:
 - experiment name and resolved experiment root
 - detected primary artifacts
 - whether `input/analytical.F` exists and whether it appears relevant
+- selected registered compile source, if provided
 - count of required, optional, ignored, and ambiguous assets
 - warning and finding count
 - path to `metadata/manifest.json`
@@ -175,6 +336,8 @@ Must not modify:
 
 - `input/`
 - existing scripts or source code outside the experiment managed directories
+
+Import must not modify `CROCO_EXPERIMENTS/sources/<source_id>/`; it only reads the source registry to resolve `--source`.
 
 ## `crocoexp inspect <experiment_name>`
 
@@ -220,6 +383,7 @@ The command must print:
 
 - manifest status and timestamp
 - compile-time findings summary
+- selected registered compile source, if present
 - runtime findings summary
 - asset classification counts
 - reporting status
@@ -246,6 +410,14 @@ Attempt CROCO compilation through Docker using staged compile-related artifacts 
 
 Compile records what was attempted and what failed or succeeded. It must not fail merely because runtime metadata suggests a possible semantic mismatch.
 
+Compile uses a registered compile source selected for the experiment. Source resolution order is:
+
+1. explicit `--source <source_id>`, if supported by the implementation
+2. `compile_time.source_ref` recorded in `metadata/manifest.json`
+3. hard failure if no source is known
+
+There is no setup-level or global CROCO version/source selection.
+
 ### Minimal arguments
 
 - `<experiment_name>`
@@ -256,6 +428,7 @@ Compile records what was attempted and what failed or succeeded. It must not fai
 - `--clean`: clear generated build artifacts for this experiment before compiling.
 - `--override <path>`: host-side override file for staging or backend settings.
 - `--image <name-or-id>`: Docker image to use.
+- `--source <source_id>`: optional future override for the compile source used in this attempt.
 - `--jobs <n>`: build parallelism.
 - `--json`: emit machine-readable build summary.
 - `--strict`: optional future mode that fails before compile on warnings, ambiguity, contradiction, or possible semantic mismatch.
@@ -276,7 +449,7 @@ May create or update:
 ### Exit code behavior
 
 - `0`: compile completed and binary/build output is host-visible.
-- `3`: required compile-time artifact is missing.
+- `3`: required compile-time artifact is missing, no source is known for the experiment, or the selected registered source is missing.
 - `4`: metadata writing failure, report generation failure, or inability to construct the requested compile staging plan before Docker execution.
 - `5`: optional strict policy failed before compile.
 - `7`: Docker backend failure.
@@ -289,6 +462,7 @@ The command must print:
 - Docker image used
 - experiment root and build directory
 - compile-time artifacts used
+- registered compile source used, including `source_id`, flavor, declared version, and installed host path
 - whether `analytical.F` was staged and why
 - warnings, ambiguities, contradictions, or possible semantic findings carried into the attempt
 - build log path
@@ -313,6 +487,7 @@ May modify:
 Must not modify:
 
 - `input/`, except reading user-provided artifacts
+- `CROCO_EXPERIMENTS/sources/<source_id>/`, except reading registered source files as compile inputs
 - `runs/`, except possibly recording no run state
 
 ## `crocoexp dry-run <experiment_name>`
@@ -347,6 +522,7 @@ May create or update:
 - `runs/<run_id>/snapshots/`
 
 Snapshots may contain effective config/code artifacts for reproducibility. Runtime data assets such as `.nc` files remain canonical in `input/` and must be represented in snapshots by references, hashes, sizes, and mappings rather than copied.
+Snapshots should include the selected registered compile source reference when present, but should not copy the full source tree.
 
 ### Exit code behavior
 
@@ -361,6 +537,7 @@ Snapshots may contain effective config/code artifacts for reproducibility. Runti
 The command must print:
 
 - compile-time findings summary
+- selected registered compile source, if present
 - runtime findings summary
 - required, optional, ignored, and ambiguous asset lists with reasons
 - warning and possible mismatch summaries
@@ -428,6 +605,7 @@ Creates or updates:
 - `metadata/run_index.json`, if a run index is used
 
 Run outputs must never be written back into `input/`.
+Run snapshots should include the selected registered compile source reference when present, but should not copy the full source tree.
 
 ### Exit code behavior
 
@@ -445,6 +623,7 @@ The command must print:
 - run id
 - Docker image used
 - binary/build product used
+- selected registered compile source, if present
 - selected asset mappings
 - warning and possible semantic finding summary
 - log path

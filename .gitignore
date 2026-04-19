@@ -1,24 +1,15 @@
-# CROCO distros (no versionar)
-CROCO_EXPERIMENTS/croco-v*/
+# Repo-local backend and source registry state
+.crocoexp/
 
-# Generated build/runtime artifacts
-**/build/*
-**/OUT/*
-**/LOG/*
-**/*.o
-**/*.a
-**/*.mod
+# Managed experiments, installed compile sources, builds, runs, and runtime data
+CROCO_EXPERIMENTS/
 
-# Big / binary / netcdf outputs
-**/*.nc
-**/*.cdf
-**/*.grd
-**/*.rst
-**/*.his
-**/*.avg
-**/*.dia
+# Python/test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
 
-# OS / editor
+# OS/editor artifacts
 .DS_Store
 *.swp
 *~

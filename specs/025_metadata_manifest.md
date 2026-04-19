@@ -14,6 +14,20 @@ Generated metadata, reports, build products, logs, snapshots, and run outputs mu
 
 The manifest supports traceability. It must not imply that the builder has proven scientific correctness, compile-time correctness, runtime semantic compatibility, or experiment well-posedness.
 
+Registered compile source metadata is repo-level infrastructure state, not experiment evidence. The source registry lives at:
+
+```text
+.crocoexp/sources.json
+```
+
+Registered source trees are copied under:
+
+```text
+CROCO_EXPERIMENTS/sources/<source_id>/
+```
+
+An experiment manifest may record a selected source in `compile_time.source_ref`, but the source tree itself is not copied into the experiment `input/` directory.
+
 ## Canonical manifest path
 
 The canonical manifest file is:
@@ -36,6 +50,42 @@ CROCO_EXPERIMENTS/<experiment_name>/runs/<run_id>/reports/
 ```
 
 There should be one canonical manifest. Reports may be regenerated from the manifest, current artifacts, and command history when possible.
+
+## Source registry path
+
+The repo-level source registry is:
+
+```text
+.crocoexp/sources.json
+```
+
+It records compile sources installed under:
+
+```text
+CROCO_EXPERIMENTS/sources/<source_id>/
+```
+
+The registry should contain one record per source id. Required fields for each record:
+
+- `source_id`
+- `host_path`
+- `container_path`
+- `flavor`
+- `declared_version`
+- `installed_at`
+- `origin_path`
+- `notes`
+
+Recommended fields when practical:
+
+- `git_commit`
+- `git_branch`
+- `content_hash`
+- `detected_layout`
+- `installed_by_command`
+- `warnings`
+
+This registry is repo-level infrastructure state. It is not a global source/version selector, and `crocoexp setup` must not write experiment-level source metadata.
 
 ## Required manifest fields
 
@@ -133,6 +183,7 @@ Records findings derived from compile-related artifacts.
 
 Required fields:
 
+- `source_ref`, for compilable experiments when a source has been selected
 - `source_artifacts`
 - `parsed_symbols`
 - `detected_flags`
@@ -152,6 +203,27 @@ Required fields:
 - `ambiguous`
 
 Compile-time findings must remain separate from runtime findings. They are descriptive metadata, not proof that compilation will succeed.
+
+Minimum `source_ref` shape:
+
+```json
+{
+  "source_id": "croco-v2.1.2",
+  "flavor": "croco",
+  "declared_version": "v2.1.2",
+  "host_path": "CROCO_EXPERIMENTS/sources/croco-v2.1.2",
+  "container_path": "/opt/CROCO_EXPERIMENTS/sources/croco-v2.1.2",
+  "registry_path": ".crocoexp/sources.json",
+  "origin_path": "/path/copied/from",
+  "git_commit": "optional",
+  "git_branch": "optional",
+  "detected_layout": "optional",
+  "selected_at": "timestamp",
+  "selection_source": "import --source"
+}
+```
+
+`source_ref` is part of compile input traceability. It is not a semantic assertion that the source can compile, matches the experiment, or is scientifically correct.
 
 ### `runtime`
 
@@ -348,6 +420,7 @@ Required fields for each command record:
 - `command`
 - `arguments`
 - `inputs_used`
+- `source_ref`, when a registered compile source is used or selected by the command
 - `staging_decisions`
 - `host_container_mappings`
 - `docker_image`, when applicable
@@ -395,6 +468,8 @@ Each snapshot record must include:
 
 Snapshots may copy effective config/code artifacts such as `croco.in`, `cppdefs.h`, `param.h`, and staged `analytical.F`. Runtime data assets such as `.nc` files must remain canonical in `input/` and must be represented by paths, hashes, sizes, and mappings rather than duplicated.
 
+Snapshots for compile, dry-run, and run should include the selected `compile_time.source_ref` or a reference to it. Snapshots should not duplicate entire registered source trees during normal workflow; they should record source id, installed path, registry metadata, git commit or content identity when practical, and the staged source/config files actually used.
+
 ### `history`
 
 Records high-level activity. It may summarize `commands`.
@@ -414,6 +489,7 @@ Each entry must include:
 These fields should be recomputed whenever import, inspect with recompute, compile, dry-run, or run refreshes metadata:
 
 - `input_evidence`
+- `compile_time.source_ref`, when a selected source is present and registry metadata needs refresh
 - `compile_time.parsed_symbols`
 - `compile_time.detected_flags`
 - `compile_time.dimensions`
@@ -434,6 +510,7 @@ These fields should be recomputed whenever import, inspect with recompute, compi
 These fields are persisted because they record decisions or history:
 
 - `experiment.created_at`
+- `compile_time.source_ref.source_id`, when selected at import or by an explicit compile source option
 - `overrides`
 - `docker_backend.image`, if explicitly selected
 - `commands`
@@ -451,6 +528,8 @@ These fields should be compared against prior values:
 - build input hash used for binary provenance
 
 If primary artifacts or assets selected for staging/mounting change after a report, `reporting.status` should become `stale` until refreshed.
+
+If registered source metadata changes in `.crocoexp/sources.json` or the installed source path changes after import, compile reports should mark the source reference as stale or changed. This is traceability metadata, not semantic validation.
 
 ## Asset inventory structure
 
@@ -586,6 +665,7 @@ Snapshots must include:
 - effective `cppdefs.h`
 - effective `param.h`
 - effective `analytical.F`, when staged or used
+- selected registered compile source reference
 - manifest copy or manifest hash
 - asset inventory
 - host path to container path mappings
@@ -595,9 +675,13 @@ Snapshots must include:
 
 Snapshots must not duplicate runtime data assets such as `.nc` files during normal workflow. They should record path, size, hash when practical, and mapping.
 
+Snapshots should not duplicate full registered source trees during normal workflow. They may copy the staged compile files that were actually used, and they must record source registry metadata sufficient to identify the selected source.
+
 ## Separate compile-time and runtime records
 
 Compile-time findings and runtime findings must remain separate in the manifest.
+
+Registered compile source selection belongs to `compile_time.source_ref`. It is separate from runtime findings and from Docker image selection.
 
 The asset classification layer may refer to both, but it must preserve the chain of reasoning:
 
@@ -613,6 +697,7 @@ Overrides must be explicit, host-side, and recorded in the manifest.
 
 An override may:
 
+- choose a registered compile source for a compile attempt, when the CLI supports explicit source overrides
 - choose between ambiguous asset roles
 - supply a missing path mapping
 - mark a runtime reference as intentionally not selected for staging/mounting when parser-level evidence cannot resolve it
@@ -622,6 +707,7 @@ An override may:
 An override may not:
 
 - move or duplicate `.nc` runtime data out of `input/` as normal workflow
+- turn `crocoexp setup` into a global source selector
 - relabel generated files as user evidence
 - suppress command logs or failure records
 - convert an absent file classified as required for staging/mounting into a successful mounted asset

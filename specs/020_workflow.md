@@ -7,6 +7,7 @@ All normal user actions happen from the host.
 The user should be able to:
 
 - place real CROCO artifacts in `CROCO_EXPERIMENTS/<experiment_name>/input/`
+- register one or more compile source trees under `CROCO_EXPERIMENTS/sources/<source_id>/`
 - import or inspect the experiment from host-side commands
 - compile through Docker from a host-side command
 - produce a dry-run report from a host-side command
@@ -19,6 +20,22 @@ The user should not need to:
 - copy files by hand into the container
 - edit container-local files
 - know container-internal paths for normal operation
+- maintain a global CROCO version setting for all experiments
+
+An expected repo-level flow may be:
+
+```text
+crocoexp setup
+crocoexp source install /path/to/source --id <source_id>
+crocoexp source list
+crocoexp source inspect <source_id>
+crocoexp import <experiment_name> --source <source_id>
+crocoexp compile <experiment_name>
+crocoexp dry-run <experiment_name>
+crocoexp run <experiment_name>
+```
+
+`crocoexp setup` prepares Docker backend readiness. Source registration prepares compile input provenance. Experiment import binds a registered source to a specific experiment.
 
 ## Storage policy
 
@@ -37,6 +54,13 @@ CROCO_EXPERIMENTS/<experiment_name>/
       reports/
 ```
 
+Repo-level source infrastructure uses:
+
+```text
+CROCO_EXPERIMENTS/sources/<source_id>/
+.crocoexp/sources.json
+```
+
 Rules:
 
 - `input/` is canonical for user-provided evidence.
@@ -45,8 +69,33 @@ Rules:
 - `metadata/` contains generated manifests, findings, reports, and command records.
 - `build/` contains staged compile files and build products.
 - `runs/<run_id>/` contains generated logs, outputs, snapshots, and reports.
+- `sources/<source_id>/` contains copied registered compile source trees.
+- `.crocoexp/sources.json` contains the repo-level source registry.
+- Registered sources are compile infrastructure, not experiment `input/` evidence.
+- `crocoexp setup` does not select a global compile source.
 - Generated files must always be distinguishable from user-provided files.
 - Run outputs never go back into `input/`.
+
+## Register compile sources
+
+Before compiling, the repo may register compile source trees:
+
+```text
+crocoexp source install /path/to/source --id <source_id>
+crocoexp source list
+crocoexp source inspect <source_id>
+```
+
+The install step should:
+
+- verify the origin source path exists
+- copy the source tree into `CROCO_EXPERIMENTS/sources/<source_id>/`
+- register the source in `.crocoexp/sources.json`
+- record flavor, declared version, origin path, install time, and optional git metadata when practical
+
+Registered sources may be official CROCO trees, MSOT trees, custom forks, or patched local trees. Source registration controls compile input provenance. It does not prove that the source tree is scientifically correct, technically correct, or compatible with a given experiment.
+
+Normal workflow must not rely on symlinks to host paths outside `CROCO_EXPERIMENTS` because those paths may not exist inside the Docker mount.
 
 ## Import experiment
 
@@ -71,6 +120,7 @@ Optional artifacts:
 The import step should:
 
 - register the existing experiment folder
+- record selected registered compile source when invoked as `crocoexp import <experiment_name> --source <source_id>`
 - parse artifact-level evidence where practical
 - record compile-time findings separately from runtime findings
 - classify referenced assets for reporting and staging
@@ -86,12 +136,15 @@ Compile is launched from the host and executed by Docker.
 
 The compile step should:
 
+- resolve the compile source from an explicit source option when supported, then from `compile_time.source_ref`, and otherwise fail clearly
 - stage code and configuration files needed for compilation under `build/`
+- read registered compile source files from `CROCO_EXPERIMENTS/sources/<source_id>/`
 - read compile-related evidence from `input/`
 - include `analytical.F` only when artifact-level evidence or user policy says it should be staged
 - write build logs to the host
 - write the compiled binary or build product to a host-visible location
 - record inputs used, staging decisions, Docker command details, exit code, and failure category
+- record the selected source id and source metadata in compile reports and snapshots
 - leave `.nc` and similar runtime data assets in `input/`
 
 Compile is an attempt. The builder does not prove in advance that the compile-time directives are correct or that the build will succeed. Compile should not fail merely because runtime metadata contains warnings, ambiguities, contradictions, or possible semantic mismatches.
@@ -99,6 +152,7 @@ Compile is an attempt. The builder does not prove in advance that the compile-ti
 Compile may hard-fail by default for:
 
 - missing primary compile artifacts
+- missing or unknown registered compile source
 - inability to write metadata or construct the requested compile staging plan
 - Docker/backend failure
 - actual compile failure reported by the build process
@@ -174,6 +228,7 @@ Snapshots should include:
 - effective `cppdefs.h`
 - effective `param.h`
 - effective `analytical.F`, when used
+- selected registered compile source reference and registry metadata
 - asset inventory with builder staging/mounting classification and provenance
 - host-to-container mount mapping
 - Docker image identifier
@@ -186,6 +241,9 @@ Runtime data assets such as `.nc` files should not be duplicated into snapshots 
 ## Minimal acceptance criteria
 
 - A user can import an experiment from `input/croco.in`, `input/cppdefs.h`, and `input/param.h` without selecting a hardcoded case.
+- A user can install and inspect registered compile sources under `CROCO_EXPERIMENTS/sources/<source_id>/`.
+- Import can record a per-experiment registered compile source using `--source <source_id>`.
+- Compile uses the experiment's registered source reference rather than a setup-level global version.
 - The system records whether `input/analytical.F` exists and whether it appears relevant.
 - The system does not always require `GRD_FILE`, `INI_FILE`, and `FRC_FILE`.
 - Required, optional, ignored, and ambiguous staging/mounting classifications are reported with reasons.

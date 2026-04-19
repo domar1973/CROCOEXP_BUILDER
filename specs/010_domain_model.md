@@ -21,6 +21,35 @@ It contains:
 
 An experiment is not a hardcoded case. It is an artifact-backed workspace assembled from real files and recorded findings.
 
+### Registered compile source
+
+A registered compile source is a repo-level source tree that can be selected as a compile input for one or more experiments.
+
+Registered sources are stored under:
+
+```text
+CROCO_EXPERIMENTS/sources/<source_id>/
+```
+
+They may represent:
+
+- official CROCO source trees
+- MSOT source trees
+- custom forks
+- patched local source trees
+
+The key concept is `source_id`, not a global CROCO version. A source is selected per experiment and recorded in that experiment's compile-time metadata as `compile_time.source_ref`.
+
+Registered source metadata is recorded in:
+
+```text
+.crocoexp/sources.json
+```
+
+The source registry is repo-level infrastructure state. It is not experiment `input/` evidence, and it is not selected by `crocoexp setup`.
+
+Normal workflow copies a source tree into `CROCO_EXPERIMENTS/sources/<source_id>/`. Symlinks to host paths outside `CROCO_EXPERIMENTS` are not the default mechanism because they may be broken inside the Docker mount.
+
 ### Input evidence
 
 `input/` is the canonical evidence folder. It may contain:
@@ -42,6 +71,7 @@ Primary inputs:
 
 - `input/cppdefs.h`
 - `input/param.h`
+- selected registered compile source under `CROCO_EXPERIMENTS/sources/<source_id>/`
 - source files or includes staged for compilation
 - optional `input/analytical.F`
 
@@ -50,6 +80,7 @@ Findings may include:
 - detected CPP symbols or flags
 - dimensions or constants parsed from `param.h`
 - whether `analytical.F` exists and appears relevant
+- selected compile source reference and registry metadata
 - files staged for compilation
 - warnings or suspicious combinations
 
@@ -106,8 +137,9 @@ The Docker backend is the execution adapter for compiling and running CROCO.
 
 Responsibilities:
 
-- Use or build the required image.
+- Use the selected Docker image.
 - Mount the whole `CROCO_EXPERIMENTS` directory.
+- Make registered compile sources under `CROCO_EXPERIMENTS/sources/` available to compile commands.
 - Run compile, dry-run support, and model execution commands.
 - Return logs, exit codes, and generated outputs to host-side locations.
 
@@ -131,6 +163,7 @@ These files define what the user is asking the builder to manage and attempt. Th
 
 Generated metadata records:
 
+- selected registered compile source for the experiment, when known
 - compile-time findings
 - runtime findings
 - asset inventory and classifications
@@ -142,6 +175,23 @@ Generated metadata records:
 - warnings, ambiguities, possible inconsistencies, and failures
 
 Generated metadata supports traceability and diagnostics. It should be regenerable from `input/` and command history whenever possible.
+
+### Source registry
+
+The source registry records repo-level compile source assets installed under `CROCO_EXPERIMENTS/sources/`.
+
+It records:
+
+- `source_id`
+- installed host path under `CROCO_EXPERIMENTS/sources/<source_id>/`
+- flavor such as `croco`, `msot`, or `custom`
+- declared version, when known
+- origin path copied from
+- installation timestamp
+- optional git branch and commit
+- detected layout and content identity when practical
+
+The registry is a source of truth for registered compile infrastructure, not for experiment science. It does not prove that a source tree is correct, complete, compatible with an experiment, or able to compile.
 
 ### User overrides
 
@@ -166,6 +216,7 @@ Examples:
 
 - Which CPP flags are present.
 - Which dimensions and model limits are present in `param.h`.
+- Which registered compile source was selected for this builder attempt.
 - Whether `analytical.F` is present and appears relevant.
 - Which files were staged for compilation.
 
@@ -181,6 +232,7 @@ Examples:
 Rules:
 
 - Compile-time and runtime findings must be recorded separately.
+- The registered compile source selected for compilation must be recorded as compile-time traceability, separate from runtime findings.
 - The builder may compare them and report possible mismatches, contradictions, ambiguities, or suspicious combinations as findings.
 - The comparison is descriptive and diagnostic, not a theorem proving step.
 - Compile and run commands may proceed with reported warnings, ambiguities, contradictions, or possible mismatches unless blocked by missing primary artifacts, inability to write metadata, inability to construct the requested staging/mounting plan, missing binary for run, explicit strict policy, Docker/backend failure, compile failure, or run failure.
@@ -196,9 +248,12 @@ Examples:
 
 - `croco.in` contains a parser-recognized reference that the builder selects for staging or mounting in the run attempt.
 - A compile command needs `cppdefs.h`, `param.h`, or a staged source/config file.
+- A compile command needs a registered compile source selected by `compile_time.source_ref` or an explicit source option when supported.
 - A user-selected resume mode names a restart file that must be mounted.
 
 Missing required files are infrastructural blockers because the builder cannot stage or mount what is absent.
+
+Missing or unknown registered compile sources are infrastructural blockers for compile because the builder cannot construct the requested compile input plan. This is not a semantic judgment about CROCO or MSOT.
 
 ### Optional
 

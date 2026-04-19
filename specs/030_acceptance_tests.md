@@ -15,6 +15,9 @@ All tests assume:
 - the builder reports artifact-level findings but does not prove scientific or semantic correctness
 - only infrastructural blockers hard-fail by default
 - “required” means required for the builder’s staging/mounting plan, not proof of CROCO scientific necessity
+- registered compile sources live under `CROCO_EXPERIMENTS/sources/<source_id>/`
+- `.crocoexp/sources.json` records repo-level source registry state
+- compile source selection is per experiment, not a setup-level global version
 
 ## 1. Import minimal experiment from `input/`
 
@@ -102,7 +105,11 @@ CROCO_EXPERIMENTS/compile_ok/input/croco.in
 CROCO_EXPERIMENTS/compile_ok/input/cppdefs.h
 CROCO_EXPERIMENTS/compile_ok/input/param.h
 CROCO_EXPERIMENTS/compile_ok/metadata/manifest.json
+CROCO_EXPERIMENTS/sources/croco-v2.1.2/
+.crocoexp/sources.json
 ```
+
+The manifest contains `compile_time.source_ref.source_id: croco-v2.1.2`.
 
 ### Command invoked
 
@@ -113,6 +120,7 @@ crocoexp compile compile_ok
 ### Expected classification result
 
 - Compile-time artifacts are recorded as inputs to the attempt.
+- The compile source is resolved from `compile_time.source_ref`.
 - Runtime `.nc` data assets, if any, remain in `input/` and are not copied to `build/`.
 - `analytical.F` is staged only when artifact-level evidence or user policy says it should be staged.
 - Runtime warnings do not block compile by default.
@@ -133,6 +141,7 @@ Success with exit code `0` when Docker and CROCO compilation succeed. Failure us
 ### Expected diagnostic summary
 
 Diagnostics show Docker image, compile artifacts used, staging decisions, build log path, generated binary/build product path on success, and no instruction requiring container entry.
+Diagnostics also show the registered source id and installed source path.
 
 ## 4. Dry-run from host
 
@@ -597,3 +606,382 @@ Success with exit code `0` if Docker and CROCO execution succeed.
 ### Expected diagnostic summary
 
 Diagnostics show snapshot path and confirm the snapshot contains effective configuration, asset inventory, Docker image identifier, command summary, and host path to container path mappings.
+
+## 15. Source install for official CROCO tree
+
+### Initial filesystem setup
+
+```text
+/tmp/source_origins/croco-v2.1.2/
+CROCO_EXPERIMENTS/
+```
+
+The origin path contains a plausible CROCO source tree.
+
+### Command invoked
+
+```text
+crocoexp source install /tmp/source_origins/croco-v2.1.2 --id croco-v2.1.2 --flavor croco --declared-version v2.1.2
+```
+
+### Expected classification result
+
+- The source is registered as compile infrastructure.
+- The source is not treated as experiment `input/` evidence.
+- No semantic claim is made about whether this source can compile a given experiment.
+
+### Expected generated paths
+
+```text
+CROCO_EXPERIMENTS/sources/croco-v2.1.2/
+.crocoexp/sources.json
+```
+
+### Expected success/failure
+
+Success with exit code `0` if copy and registry writing succeed.
+
+### Expected diagnostic summary
+
+Diagnostics show source id, flavor, declared version, origin path, installed path, and registry path.
+
+## 16. Source install for MSOT tree
+
+### Initial filesystem setup
+
+```text
+/tmp/source_origins/msot-main/
+CROCO_EXPERIMENTS/
+```
+
+### Command invoked
+
+```text
+crocoexp source install /tmp/source_origins/msot-main --id msot-main --flavor msot
+```
+
+### Expected classification result
+
+- The source is registered with flavor `msot`.
+- MSOT is accepted as a registered compile source, not forced into an official CROCO version category.
+
+### Expected generated paths
+
+```text
+CROCO_EXPERIMENTS/sources/msot-main/
+.crocoexp/sources.json
+```
+
+### Expected success/failure
+
+Success with exit code `0` if copy and registry writing succeed.
+
+### Expected diagnostic summary
+
+Diagnostics show that MSOT is registered as compile infrastructure and not as global setup state.
+
+## 17. Source list returns registered IDs
+
+### Initial filesystem setup
+
+```text
+.crocoexp/sources.json
+CROCO_EXPERIMENTS/sources/croco-v2.1.2/
+CROCO_EXPERIMENTS/sources/msot-main/
+```
+
+### Command invoked
+
+```text
+crocoexp source list
+```
+
+### Expected classification result
+
+- Registered sources are listed by `source_id`.
+- No experiment metadata is modified.
+
+### Expected generated paths
+
+No generated paths.
+
+### Expected success/failure
+
+Success with exit code `0`.
+
+### Expected diagnostic summary
+
+Diagnostics list `croco-v2.1.2` and `msot-main` with installed paths, flavor, declared version when known, and install timestamp.
+
+## 18. Source inspect returns detailed metadata
+
+### Initial filesystem setup
+
+```text
+.crocoexp/sources.json
+CROCO_EXPERIMENTS/sources/croco-v2.1.2/
+```
+
+### Command invoked
+
+```text
+crocoexp source inspect croco-v2.1.2
+```
+
+### Expected classification result
+
+- Source registry metadata is displayed.
+- The command remains read-only.
+
+### Expected generated paths
+
+No generated paths.
+
+### Expected success/failure
+
+Success with exit code `0`.
+
+### Expected diagnostic summary
+
+Diagnostics show source id, flavor, declared version, installed host path, origin path, git metadata when available, detected layout, and content identity when practical.
+
+## 19. Import with `--source` records `compile_time.source_ref`
+
+### Initial filesystem setup
+
+```text
+CROCO_EXPERIMENTS/import_with_source/input/croco.in
+CROCO_EXPERIMENTS/import_with_source/input/cppdefs.h
+CROCO_EXPERIMENTS/import_with_source/input/param.h
+CROCO_EXPERIMENTS/sources/croco-v2.1.2/
+.crocoexp/sources.json
+```
+
+### Command invoked
+
+```text
+crocoexp import import_with_source --source croco-v2.1.2
+```
+
+### Expected classification result
+
+- `compile_time.source_ref.source_id` is `croco-v2.1.2`.
+- The source is recorded as compile input traceability.
+- The source tree is not copied into `input/`.
+
+### Expected generated paths
+
+```text
+CROCO_EXPERIMENTS/import_with_source/metadata/manifest.json
+CROCO_EXPERIMENTS/import_with_source/metadata/import_report.md
+```
+
+### Expected success/failure
+
+Success with exit code `0`.
+
+### Expected diagnostic summary
+
+Diagnostics show the selected source id, flavor, declared version, and installed host path.
+
+## 20. Compile uses `source_ref` from manifest
+
+### Initial filesystem setup
+
+```text
+CROCO_EXPERIMENTS/compile_source_ref/input/croco.in
+CROCO_EXPERIMENTS/compile_source_ref/input/cppdefs.h
+CROCO_EXPERIMENTS/compile_source_ref/input/param.h
+CROCO_EXPERIMENTS/compile_source_ref/metadata/manifest.json
+CROCO_EXPERIMENTS/sources/croco-v2.1.2/
+.crocoexp/sources.json
+```
+
+The manifest contains `compile_time.source_ref.source_id: croco-v2.1.2`.
+
+### Command invoked
+
+```text
+crocoexp compile compile_source_ref
+```
+
+### Expected classification result
+
+- Compile resolves the source from manifest `compile_time.source_ref`.
+- Compile reports the registered source as an input.
+- The registered source is read as compile infrastructure.
+
+### Expected generated paths
+
+```text
+CROCO_EXPERIMENTS/compile_source_ref/build/stage/
+CROCO_EXPERIMENTS/compile_source_ref/build/logs/
+CROCO_EXPERIMENTS/compile_source_ref/build/output/
+CROCO_EXPERIMENTS/compile_source_ref/metadata/compile_report.md
+```
+
+### Expected success/failure
+
+Success with exit code `0` when Docker and compilation succeed.
+
+### Expected diagnostic summary
+
+Diagnostics show the source id, installed path, Docker image, staged files, and build log path.
+
+## 21. Compile no longer depends on a global version variable
+
+### Initial filesystem setup
+
+```text
+CROCO_EXPERIMENTS/no_global_version/input/croco.in
+CROCO_EXPERIMENTS/no_global_version/input/cppdefs.h
+CROCO_EXPERIMENTS/no_global_version/input/param.h
+CROCO_EXPERIMENTS/no_global_version/metadata/manifest.json
+CROCO_EXPERIMENTS/sources/custom-fork/
+.crocoexp/sources.json
+.crocoexp/config.json
+```
+
+The setup config contains only Docker backend image state. The manifest contains `compile_time.source_ref.source_id: custom-fork`.
+
+### Command invoked
+
+```text
+crocoexp compile no_global_version
+```
+
+### Expected classification result
+
+- Compile uses `custom-fork` from the experiment manifest.
+- Compile does not read a setup-level CROCO version/source setting.
+
+### Expected generated paths
+
+```text
+CROCO_EXPERIMENTS/no_global_version/metadata/compile_report.md
+```
+
+### Expected success/failure
+
+Success with exit code `0` when Docker and compilation succeed.
+
+### Expected diagnostic summary
+
+Diagnostics show the experiment-specific source id and Docker image separately.
+
+## 22. Source tree is copied under `CROCO_EXPERIMENTS/sources/<source_id>/`
+
+### Initial filesystem setup
+
+```text
+/tmp/source_origins/custom-fork/
+CROCO_EXPERIMENTS/
+```
+
+### Command invoked
+
+```text
+crocoexp source install /tmp/source_origins/custom-fork --id custom-fork --flavor custom
+```
+
+### Expected classification result
+
+- The registered source is a copied managed source tree.
+- The normal workflow does not register an external symlink as the main source mechanism.
+
+### Expected generated paths
+
+```text
+CROCO_EXPERIMENTS/sources/custom-fork/
+.crocoexp/sources.json
+```
+
+### Expected success/failure
+
+Success with exit code `0`.
+
+### Expected diagnostic summary
+
+Diagnostics show source copy destination under `CROCO_EXPERIMENTS/sources/custom-fork/`.
+
+## 23. Registered source is treated as read-only compile input
+
+### Initial filesystem setup
+
+```text
+CROCO_EXPERIMENTS/source_readonly/input/croco.in
+CROCO_EXPERIMENTS/source_readonly/input/cppdefs.h
+CROCO_EXPERIMENTS/source_readonly/input/param.h
+CROCO_EXPERIMENTS/source_readonly/metadata/manifest.json
+CROCO_EXPERIMENTS/sources/croco-v2.1.2/
+.crocoexp/sources.json
+```
+
+### Command invoked
+
+```text
+crocoexp compile source_readonly
+```
+
+### Expected classification result
+
+- Source files are read or copied into generated build staging as needed.
+- Build products and generated files are written under the experiment `build/`.
+- The registered source tree is not modified as part of normal compile.
+
+### Expected generated paths
+
+```text
+CROCO_EXPERIMENTS/source_readonly/build/stage/
+CROCO_EXPERIMENTS/source_readonly/build/output/
+```
+
+No generated file is expected under:
+
+```text
+CROCO_EXPERIMENTS/sources/croco-v2.1.2/
+```
+
+### Expected success/failure
+
+Success with exit code `0` when Docker and compilation succeed.
+
+### Expected diagnostic summary
+
+Diagnostics distinguish registered source input from generated build outputs.
+
+## 24. Unknown source id in import fails clearly
+
+### Initial filesystem setup
+
+```text
+CROCO_EXPERIMENTS/unknown_source/input/croco.in
+CROCO_EXPERIMENTS/unknown_source/input/cppdefs.h
+CROCO_EXPERIMENTS/unknown_source/input/param.h
+.crocoexp/sources.json
+```
+
+`missing-source` is not registered.
+
+### Command invoked
+
+```text
+crocoexp import unknown_source --source missing-source
+```
+
+### Expected classification result
+
+- No `compile_time.source_ref` is recorded as successfully resolved.
+- The failure is categorized as source registry or metadata/staging infrastructure, not semantic validation.
+
+### Expected generated paths
+
+No successful manifest is required. If a failure report is written, it must live under `metadata/` and not under `input/`.
+
+### Expected success/failure
+
+Failure with exit code `4` or another implementation-defined registry resolution code documented in the CLI contract.
+
+### Expected diagnostic summary
+
+Diagnostics name `missing-source`, identify `.crocoexp/sources.json`, and explain that the source id is not registered.
