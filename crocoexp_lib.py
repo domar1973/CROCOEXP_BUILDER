@@ -11,6 +11,9 @@ from pathlib import Path
 SCHEMA_VERSION = "0.1"
 CONTAINER_ROOT = "/opt/CROCO_EXPERIMENTS"
 DEFAULT_DOCKER_IMAGE = "domarcroco/images-for-croco:base_croco_msot-1.0.0"
+DOCKER_NETCDFLIB = "-L/opt/intel/netcdf/lib -L/opt/intel/netcdff/lib  -lnetcdff -lnetcdf"
+DOCKER_NETCDFINC = "-I/opt/intel/netcdf/include -I/opt/intel/netcdff/include"
+DOCKER_NETCDF_LD_LIBRARY_PATH = "/opt/intel/netcdf/lib:/opt/intel/netcdff/lib"
 PRIMARY_ARTIFACTS = ("croco.in", "cppdefs.h", "param.h")
 DATA_SUFFIXES = {".nc", ".nc4", ".cdf", ".netcdf"}
 CONFIG_SUFFIXES = {".in", ".h", ".F", ".F90", ".f", ".f90", ".txt", ".env"}
@@ -965,14 +968,14 @@ if [[ ! -f "${{CROCO_SRC}}/jobcomp" ]]; then
 fi
 cp -f "${{CROCO_SRC}}/jobcomp" ./jobcomp
 chmod +x ./jobcomp
-if ! command -v nf-config >/dev/null 2>&1; then
-  sed -i \\
-    -e 's|^NETCDFLIB=$(nf-config --flibs).*|NETCDFLIB="${{CROCO_NETCDFLIB-$NETCDFLIB}}"|g' \\
-    -e 's|^NETCDFINC=-I$(nf-config --includedir).*|NETCDFINC="${{CROCO_NETCDFINC-$NETCDFINC}}"|g' \\
-    ./jobcomp || true
-fi
-export CROCO_NETCDFLIB="${{CROCO_NETCDFLIB:--L/opt/intel/netcdf/lib -L/opt/intel/netcdff/lib -lnetcdff -lnetcdf}}"
-export CROCO_NETCDFINC="${{CROCO_NETCDFINC:--I/opt/intel/netcdf/include -I/opt/intel/netcdff/include}}"
+export NETCDFLIB="${{CROCO_NETCDFLIB:-{DOCKER_NETCDFLIB}}}"
+export NETCDFINC="${{CROCO_NETCDFINC:-{DOCKER_NETCDFINC}}}"
+export CROCO_NETCDFLIB="${{NETCDFLIB}}"
+export CROCO_NETCDFINC="${{NETCDFINC}}"
+sed -i \\
+  -e 's|^NETCDFLIB=.*|NETCDFLIB="${{CROCO_NETCDFLIB}}"|g' \\
+  -e 's|^NETCDFINC=.*|NETCDFINC="${{CROCO_NETCDFINC}}"|g' \\
+  ./jobcomp || true
 if [[ -z "${{CROCO_CFT1:-}}" ]]; then
   if command -v ifort >/dev/null 2>&1; then
     export CROCO_CFT1="ifort"
@@ -1231,11 +1234,14 @@ def write_run_script(paths, run_dir, binary):
 set -euo pipefail
 mkdir -p "{output_container}"
 cd "{output_container}"
+export NETCDFLIB="${{CROCO_NETCDFLIB:-{DOCKER_NETCDFLIB}}}"
+export NETCDFINC="${{CROCO_NETCDFINC:-{DOCKER_NETCDFINC}}}"
+export LD_LIBRARY_PATH="{DOCKER_NETCDF_LD_LIBRARY_PATH}:${{LD_LIBRARY_PATH:-}}"
 if [[ ! -x "{binary_container}" ]]; then
   echo "ERROR: selected binary is not executable: {binary_container}"
   exit 70
 fi
-"{binary_container}" < "{croco_in_container}"
+"{binary_container}" "{croco_in_container}"
 """
     script.write_text(text, encoding="utf-8")
     script.chmod(0o755)
