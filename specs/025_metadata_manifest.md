@@ -8,9 +8,9 @@ The canonical evidence for an experiment is the user-provided `input/` directory
 CROCO_EXPERIMENTS/<experiment_name>/input/
 ```
 
-Metadata is derived from that evidence. It records findings, mappings, overrides, staging decisions, command attempts, logs, reports, failures, and reproducibility details. It is not the source of truth for the experiment itself.
+Metadata is derived from that evidence. It records findings, mappings, symlink plans, staging decisions, command attempts, logs, reports, failures, and reproducibility details. It is not the source of truth for the experiment itself.
 
-Generated metadata, reports, build products, logs, snapshots, and run outputs must live outside `input/`.
+Generated metadata, reports, build products, work directories, logs, snapshots, and run outputs must live outside `input/`.
 
 The manifest supports traceability. It must not imply that the builder has proven scientific correctness, compile-time correctness, runtime semantic compatibility, or experiment well-posedness.
 
@@ -27,6 +27,8 @@ CROCO_EXPERIMENTS/sources/<source_id>/
 ```
 
 An experiment manifest may record a selected source in `compile_time.source_ref`, but the source tree itself is not copied into the experiment `input/` directory.
+
+`run.env` is not supported and must not appear as a configuration source in the manifest. If present under `input/`, it is recorded only as an ignored ordinary user file.
 
 ## Canonical manifest path
 
@@ -98,15 +100,18 @@ paths
 input_evidence
 compile_time
 runtime
+runtime_materialization
 capabilities
 assets
-overrides
 reporting
 docker_backend
 commands
 snapshots
 history
+runtime_execution_plan
 ```
+
+The legacy `overrides` field is not required in this spec. Runtime behavior is governed by the input tree convention, not override-driven asset classification.
 
 ### `schema_version`
 
@@ -172,10 +177,13 @@ Primary evidence roles:
 - `cppdefs_h`
 - `param_h`
 - `analytical_f`
-- `runtime_asset`
+- `runtime_data`
+- `ignored_user_file`
 - `other_user_file`
 
 The presence of `input/analytical.F` must be recorded separately from whether it appears relevant for the current builder attempt, staged, not staged, or ambiguous.
+
+`run.env`, when present, must use role `ignored_user_file` with a note that CROCOEXP does not support environment-file substitution.
 
 ### `compile_time`
 
@@ -208,11 +216,11 @@ Minimum `source_ref` shape:
 
 ```json
 {
-  "source_id": "croco-v2.1.2",
+  "source_id": "croco-v2.1.3",
   "flavor": "croco",
-  "declared_version": "v2.1.2",
-  "host_path": "CROCO_EXPERIMENTS/sources/croco-v2.1.2",
-  "container_path": "/opt/CROCO_EXPERIMENTS/sources/croco-v2.1.2",
+  "declared_version": "v2.1.3",
+  "host_path": "CROCO_EXPERIMENTS/sources/croco-v2.1.3",
+  "container_path": "/opt/CROCO_EXPERIMENTS/sources/croco-v2.1.3",
   "registry_path": ".crocoexp/sources.json",
   "origin_path": "/path/copied/from",
   "git_commit": "optional",
@@ -227,18 +235,64 @@ Minimum `source_ref` shape:
 
 ### `runtime`
 
-Records findings derived from runtime artifacts.
+Records lightweight findings derived from runtime artifacts.
 
 Required fields:
 
 - `source_artifacts`
-- `parsed_keys`
-- `referenced_assets`
-- `runtime_requests`
+- `croco_in_present`
+- `unresolved_template_tokens`
+- `suspicious_absolute_paths`
+- `referenced_like_strings`
 - `warnings`
 - `findings`
 
-Runtime findings must record `croco.in` references even when later classified as optional, ignored, or ambiguous. They are descriptive metadata, not proof that execution will succeed.
+Runtime findings must not determine required runtime assets. `croco.in` is version-specific and must be treated as opaque by default.
+
+### `runtime_materialization`
+
+Records the run input contract and symlink plan.
+
+Required top-level fields:
+
+- `policy`
+- `input_root_host_path`
+- `workdir_host_path`, when a run id is known
+- `workdir_container_path`, when a run id is known
+- `binary_source_host_path`
+- `binary_workdir_relative_path`
+- `copied_files`
+- `symlinked_runtime_data`
+- `skipped_files`
+- `warnings`
+- `blockers`
+
+Allowed `policy` values:
+
+- `copy_config_symlink_netcdf`
+
+Each `copied_files` record must include:
+
+- `source_host_path`
+- `destination_host_path`
+- `destination_relative_path_from_workdir`
+- `reason`
+
+Each `symlinked_runtime_data` record must include:
+
+- `source_host_path`
+- `source_relative_path_from_input`
+- `link_host_path`
+- `link_relative_path_from_workdir`
+- `relative_symlink_target`
+- `container_link_path`
+- `container_target_path`
+- `exists`
+- `safe_target`
+- `content_hash`, when practical
+- `size_bytes`, when available
+
+`safe_target` is true only when the symlink target resolves inside the mounted `CROCO_EXPERIMENTS` tree.
 
 ### `capabilities`
 
@@ -271,8 +325,8 @@ Records the complete asset inventory.
 Required top-level fields:
 
 - `inventory`
-- `classification_counts`
-- `selected_mounts`
+- `counts`
+- `runtime_data_symlink_policy`
 
 Required fields for each asset:
 
@@ -282,58 +336,22 @@ Required fields for each asset:
 - `host_path`
 - `container_path`
 - `relative_path_from_input`, when applicable
-- `referenced_by`
-- `compile_time_relevance`
-- `runtime_relevance`
-- `classification`
-- `classification_reason`
 - `provenance`
 - `exists`
 - `content_hash`, when available and practical
 - `large_data`
-- `copy_policy`
+- `materialization_policy`
+- `generated`
 
-Allowed classifications:
+Allowed `materialization_policy` values:
 
-- `required`
-- `optional`
-- `ignored`
-- `ambiguous`
-
-Required `copy_policy` values:
-
-- `remain_in_input`
-- `stage_copy_allowed`
-- `snapshot_copy_allowed`
+- `copy_to_workdir`
+- `symlink_into_workdir`
 - `metadata_only`
+- `not_materialized`
+- `generated_output`
 
-Data assets such as `.nc` files must use `remain_in_input` for normal workflow. They must not use `snapshot_copy_allowed` or `stage_copy_allowed` in normal workflow. The manifest must explicitly record that these files were not duplicated or moved.
-
-### `overrides`
-
-Records user-provided overrides.
-
-Required fields for each override:
-
-- `id`
-- `source_file`
-- `scope`
-- `target`
-- `value`
-- `reason`
-- `applied`
-- `diagnostics`
-
-Override scopes may include:
-
-- `asset_classification`
-- `path_mapping`
-- `capability_disambiguation`
-- `docker_backend`
-- `run_option`
-- `strict_policy`
-
-Overrides clarify builder behavior. They do not prove scientific or semantic correctness.
+Data assets such as `.nc` files must use `symlink_into_workdir` for run materialization. They must not use copy policies in normal workflow.
 
 ### `reporting`
 
@@ -346,7 +364,7 @@ Required fields:
 - `manifest_hash`
 - `checks`
 - `warnings`
-- `ambiguities`
+- `suspicious_findings`
 - `possible_mismatches`
 - `contradictions`
 - `infrastructural_blockers`
@@ -365,6 +383,7 @@ Allowed reporting statuses:
 - `blocked_backend`
 - `blocked_compile_failure`
 - `blocked_run_failure`
+- `blocked_workdir_materialization`
 - `blocked_strict_policy`
 - `stale`
 
@@ -381,9 +400,7 @@ Allowed check scopes:
 - `input_evidence`
 - `compile_time`
 - `runtime`
-- `asset_resolution`
-- `staging`
-- `mounting`
+- `runtime_materialization`
 - `docker_backend`
 - `snapshot`
 
@@ -409,6 +426,8 @@ Each mount record must include:
 
 The whole `CROCO_EXPERIMENTS` directory mount must be represented.
 
+For run commands, `working_directory` must be the container path corresponding to `runs/<run_id>/work/`.
+
 ### `commands`
 
 Records attempted commands.
@@ -422,6 +441,7 @@ Required fields for each command record:
 - `inputs_used`
 - `source_ref`, when a registered compile source is used or selected by the command
 - `staging_decisions`
+- `runtime_materialization_ref`, when applicable
 - `host_container_mappings`
 - `docker_image`, when applicable
 - `logs_produced`
@@ -438,6 +458,7 @@ Allowed failure categories:
 - `missing_artifact`
 - `missing_binary`
 - `metadata_or_staging`
+- `workdir_materialization`
 - `strict_policy`
 - `docker_backend`
 - `compile_failure`
@@ -463,10 +484,10 @@ Each snapshot record must include:
 - `host_path`
 - `created_at`
 - `included_artifacts`
-- `asset_inventory_ref`
+- `runtime_materialization_ref`, when applicable
 - `manifest_hash`
 
-Snapshots may copy effective config/code artifacts such as `croco.in`, `cppdefs.h`, `param.h`, and staged `analytical.F`. Runtime data assets such as `.nc` files must remain canonical in `input/` and must be represented by paths, hashes, sizes, and mappings rather than duplicated.
+Snapshots may copy effective config/code artifacts such as `croco.in`, `cppdefs.h`, `param.h`, and staged `analytical.F`. Runtime data assets such as `.nc` files must remain canonical in `input/` and must be represented by paths, hashes, sizes, and symlink records rather than duplicated.
 
 Snapshots for compile, dry-run, and run should include the selected `compile_time.source_ref` or a reference to it. Snapshots should not duplicate entire registered source trees during normal workflow; they should record source id, installed path, registry metadata, git commit or content identity when practical, and the staged source/config files actually used.
 
@@ -482,6 +503,55 @@ Each entry must include:
 - `exit_code`
 - `manifest_hash_after`, when available
 
+### `runtime_execution_plan`
+
+Records how CROCOEXP intends to launch the compiled binary.
+
+Required fields:
+
+- `parallel_backend`
+- `detected_symbols`
+- `parsed_parameters`
+- `openmp`
+- `mpi`
+- `specialized_backends`
+- `environment`
+- `launcher`
+- `warnings`
+- `blockers`
+
+Allowed `parallel_backend` values:
+
+- `serial`
+- `openmp`
+- `mpi`
+- `hybrid`
+- `openacc`
+- `unsupported_complex`
+
+The `openmp` object must include:
+
+- `enabled`
+- `npp`
+- `nsub_x`
+- `nsub_e`
+- `planned_omp_num_threads`
+- `source`
+
+The `mpi` object must include:
+
+- `enabled`
+- `np_xi`
+- `np_eta`
+- `nnodes`
+- `planned_mpi_ranks`
+
+The `environment` object must record Docker environment variables set by CROCOEXP, including `OMP_NUM_THREADS` when applicable.
+
+The `launcher` object must record the wrapper command and whether Docker execution is allowed.
+
+Unsupported runtime launch profiles must appear in `blockers`.
+
 ## Recomputed vs persisted fields
 
 ### Recomputed from `input/`
@@ -493,16 +563,13 @@ These fields should be recomputed whenever import, inspect with recompute, compi
 - `compile_time.parsed_symbols`
 - `compile_time.detected_flags`
 - `compile_time.dimensions`
-- `runtime.parsed_keys`
-- `runtime.referenced_assets`
+- `runtime.unresolved_template_tokens`
+- `runtime.suspicious_absolute_paths`
 - `capabilities`
 - `assets.inventory`
-- `assets.classification_counts`
-- `assets.selected_mounts`
+- `runtime_materialization`, for a planned or actual run id
 - `reporting.checks`
 - `reporting.warnings`
-- `reporting.ambiguities`
-- `reporting.possible_mismatches`
 - `reporting.infrastructural_blockers`
 
 ### Persisted as command state
@@ -510,204 +577,83 @@ These fields should be recomputed whenever import, inspect with recompute, compi
 These fields are persisted because they record decisions or history:
 
 - `experiment.created_at`
-- `compile_time.source_ref.source_id`, when selected at import or by an explicit compile source option
-- `overrides`
-- `docker_backend.image`, if explicitly selected
+- selected `compile_time.source_ref`, unless changed by explicit import/compile option
 - `commands`
-- `snapshots.snapshot_records`
 - `history`
-- run ids and report paths
+- completed command outcomes
+- run ids
+- snapshot records
+- logs produced
+- reports produced
 
 ### Recomputed but compared for staleness
 
-These fields should be compared against prior values:
+These fields may be recomputed and compared against persisted metadata:
 
-- content hashes for primary artifacts
-- content hashes for assets selected for staging/mounting when practical
-- manifest hash used for dry-run reports
-- build input hash used for binary provenance
-
-If primary artifacts or assets selected for staging/mounting change after a report, `reporting.status` should become `stale` until refreshed.
-
-If registered source metadata changes in `.crocoexp/sources.json` or the installed source path changes after import, compile reports should mark the source reference as stale or changed. This is traceability metadata, not semantic validation.
-
-## Asset inventory structure
-
-Asset records must be concrete enough to explain classification.
-
-Example shape:
-
-```json
-{
-  "id": "asset.grid.main",
-  "role": "grid",
-  "source": "runtime_reference",
-  "host_path": "CROCO_EXPERIMENTS/demo/input/grid.nc",
-  "container_path": "/experiments/demo/input/grid.nc",
-  "relative_path_from_input": "grid.nc",
-  "referenced_by": [
-    {
-      "artifact": "input/croco.in",
-      "key": "GRD_FILE",
-      "value": "grid.nc"
-    }
-  ],
-  "compile_time_relevance": "external_grid_observed",
-  "runtime_relevance": "referenced",
-  "classification": "required",
-  "classification_reason": "Artifact-level evidence says the builder selected this file for mounting in the run attempt.",
-  "provenance": ["input/croco.in:GRD_FILE", "input/cppdefs.h"],
-  "exists": true,
-  "large_data": true,
-  "copy_policy": "remain_in_input"
-}
-```
+- content hashes of primary artifacts
+- runtime data asset inventory
+- symlink plans
+- source registry metadata
+- Docker image defaults
+- binary path and modified time
 
 ## Host path to container path mapping
 
-Every required or optional asset selected for staging/mounting should have a mapping.
+The manifest must record that Docker mounts the whole `CROCO_EXPERIMENTS` directory. Container paths for experiment files are derived from that mount.
 
-Mapping records must include:
+Symlink records must include both host and container interpretation. Because the symlink targets are relative and remain inside `CROCO_EXPERIMENTS`, they should resolve in both environments.
 
-- host path
-- container path
-- mount root
-- relative path from experiment root
-- whether the path is a direct mount path, symlink target, or staged copy
-- read/write mode
-
-For data assets under `input/`, the preferred mapping is direct access through the mounted `CROCO_EXPERIMENTS` tree. Symlinks are allowed when needed, but the symlink must point back to the canonical file under `input/`.
-
-## Content provenance
-
-Every finding must be traceable to evidence.
-
-Provenance records must include:
-
-- artifact path
-- parser or detection rule
-- key, symbol, or line reference when available
-- classification, warning, or capability affected
-
-Generated files must identify their generated origin. User-provided files under `input/` must never be relabeled as generated.
-
-## Ambiguity reporting
-
-An ambiguity record must include:
-
-- `id`
-- `scope`
-- `description`
-- `evidence`
-- `candidate_interpretations`
-- `impact`
-- `recommended_resolution`
-- `override_allowed`
-- `strict_policy_effect`
-
-Ambiguity must be surfaced in dry-run. It is a warning/reporting finding by default and a hard blocker only when strict policy requires it or when the ambiguity prevents construction of the requested staging/mounting plan.
-
-## Finding reporting
-
-A finding record for possible mismatches, contradictions, ambiguities, or suspicious combinations must include:
-
-- `id`
-- `compile_time_evidence`
-- `runtime_evidence`
-- `description`
-- `impact`
-- `recommended_review`
-- `strict_policy_effect`
-
-Examples:
-
-- Runtime requests an external forcing file while compile-time evidence appears analytical.
-- Runtime references a capability that compile-time findings did not observe.
-
-Possible mismatches, contradictions, ambiguities, and suspicious combinations are reported findings. They do not block compile or run by default because the builder is not a CROCO semantic validator.
-
-## Infrastructural blocker reporting
-
-An infrastructural blocker record must include:
-
-- `id`
-- `category`
-- `description`
-- `evidence`
-- `required_resolution`
-
-Blocker categories:
-
-- `missing_artifact`
-- `missing_binary`
-- `metadata_or_staging`
-- `mounting_plan`
-- `docker_backend`
-- `compile_failure`
-- `run_failure`
-- `strict_policy`
-
-Only infrastructural blockers hard-fail by default.
+Absolute host-path symlinks are not allowed for generated run workdirs.
 
 ## Snapshot policy
 
-Snapshots are generated under:
+Snapshots must copy or record enough information to reproduce what was attempted:
 
-```text
-CROCO_EXPERIMENTS/<experiment_name>/runs/<run_id>/snapshots/
-```
-
-Compile-specific snapshots may also be referenced from `build/` metadata, but run reproducibility snapshots belong under the run directory.
-
-Snapshots must include:
-
-- effective `croco.in`
-- effective `cppdefs.h`
-- effective `param.h`
-- effective `analytical.F`, when staged or used
-- selected registered compile source reference
-- manifest copy or manifest hash
-- asset inventory
-- host path to container path mappings
-- Docker image identifier
+- `croco.in` used in the run workdir
+- `cppdefs.h`
+- `param.h`
+- optional `analytical.F`
+- selected source reference
+- binary reference and hash when practical
+- runtime materialization plan
+- symlink records for NetCDF-like assets
+- Docker image
 - command summary
-- log references
+- logs and exit code
 
-Snapshots must not duplicate runtime data assets such as `.nc` files during normal workflow. They should record path, size, hash when practical, and mapping.
+Snapshots must not copy NetCDF-like runtime data assets during normal workflow.
 
-Snapshots should not duplicate full registered source trees during normal workflow. They may copy the staged compile files that were actually used, and they must record source registry metadata sufficient to identify the selected source.
+## Infrastructural blocker reporting
+
+The manifest must distinguish:
+
+- missing primary artifact
+- missing registered source
+- missing binary
+- unsafe symlink target
+- broken symlink target
+- inability to create workdir
+- inability to create relative symlink
+- Docker/backend failure
+- compile failure
+- run failure
+- strict-policy failure
+
+## Finding reporting
+
+Findings must include evidence and scope. Findings are not proof of failure unless they are infrastructural blockers.
+
+Examples:
+
+- `run.env_present_ignored`
+- `croco_in_contains_template_tokens`
+- `croco_in_contains_absolute_path`
+- `netcdf_assets_present`
+- `no_netcdf_assets_present`
+- `input_symlink_points_outside_experiments_root`
 
 ## Separate compile-time and runtime records
 
-Compile-time findings and runtime findings must remain separate in the manifest.
+Compile-time records must not be overwritten by runtime records.
 
-Registered compile source selection belongs to `compile_time.source_ref`. It is separate from runtime findings and from Docker image selection.
-
-The asset classification layer may refer to both, but it must preserve the chain of reasoning:
-
-```text
-compile_time finding -> runtime reference -> asset classification -> report finding
-```
-
-The manifest must support explaining why a traditional key such as `GRD_FILE`, `INI_FILE`, or `FRC_FILE` is classified as required, optional, ignored, or ambiguous for this specific builder attempt. Their mere presence in `croco.in` is not sufficient to mark them required for staging/mounting.
-
-## User overrides
-
-Overrides must be explicit, host-side, and recorded in the manifest.
-
-An override may:
-
-- choose a registered compile source for a compile attempt, when the CLI supports explicit source overrides
-- choose between ambiguous asset roles
-- supply a missing path mapping
-- mark a runtime reference as intentionally not selected for staging/mounting when parser-level evidence cannot resolve it
-- select Docker image or backend settings
-- enable strict policy
-
-An override may not:
-
-- move or duplicate `.nc` runtime data out of `input/` as normal workflow
-- turn `crocoexp setup` into a global source selector
-- relabel generated files as user evidence
-- suppress command logs or failure records
-- convert an absent file classified as required for staging/mounting into a successful mounted asset
+Runtime materialization records must not be used to claim CROCO semantic compatibility. They record filesystem visibility only.

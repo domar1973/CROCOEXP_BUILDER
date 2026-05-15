@@ -12,7 +12,7 @@ The CLI is artifact-based. It operates on experiments that already exist as host
 CROCO_EXPERIMENTS/<experiment_name>/input/
 ```
 
-The `input/` directory is the canonical user-provided evidence folder. It may contain `croco.in`, `cppdefs.h`, `param.h`, optional `analytical.F`, data files such as `.nc`, and other user-provided artifacts. Generated files must live outside `input/`.
+The `input/` directory is the canonical user-provided evidence folder. It may contain `croco.in`, `cppdefs.h`, `param.h`, optional `analytical.F`, NetCDF-like runtime data files, and other user-provided artifacts. Generated files must live outside `input/`.
 
 The CLI records findings and attempts. It does not prove scientific correctness, compile-time correctness, runtime semantic compatibility, or experiment well-posedness.
 
@@ -35,6 +35,7 @@ CROCO_EXPERIMENTS/<experiment_name>/
   build/
   runs/
     <run_id>/
+      work/
       logs/
       output/
       snapshots/
@@ -55,34 +56,88 @@ Source registry state is stored under:
 
 Registered sources are compile infrastructure. They are not experiment `input/` evidence and are not selected by `crocoexp setup`.
 
+### Runtime workdir policy
+
+`crocoexp run` must create a run-local workdir:
+
+```text
+CROCO_EXPERIMENTS/<experiment_name>/runs/<run_id>/work/
+```
+
+CROCO is executed from this workdir.
+
+The workdir contains:
+
+- a copied `croco.in`
+- the selected compiled binary as `croco` unless explicitly configured otherwise
+- relative symlinks to NetCDF-like runtime data files under `input/`, preserving each file's path relative to `input/`
+
+Example:
+
+```text
+input/GRD/mesa_grd.nc
+input/INIT/mesa_ini.nc
+
+runs/<run_id>/work/GRD/mesa_grd.nc   -> ../../../../input/GRD/mesa_grd.nc
+runs/<run_id>/work/INIT/mesa_ini.nc  -> ../../../../input/INIT/mesa_ini.nc
+```
+
+The exact symlink target is computed from the symlink parent path to the canonical file under `input/`.
+
 ### Docker mount policy
 
-Docker mounts the whole `CROCO_EXPERIMENTS` directory.
+Docker mounts the whole `CROCO_EXPERIMENTS` directory. This is required so relative symlinks from run workdirs to experiment `input/` resolve both on the host and inside the container.
 
-The CLI must record host path to container path mappings for assets selected for staging or mounting in generated metadata. Data assets such as `.nc` files remain in `input/` and are accessed by symlink or mount-path mapping when needed. They must not be copied or moved during normal import, compile, dry-run, or run workflows.
+The CLI must record host path to container path mappings for:
+
+- `CROCO_EXPERIMENTS`
+- experiment root
+- run workdir
+- run output directory
+- selected binary
+- selected source tree for compile attempts
+
+The CLI must not rely on absolute host-path symlinks inside Docker.
+
+### No `run.env`
+
+`run.env` is not supported.
+
+Rules:
+
+- No command sources `run.env`.
+- No command performs environment substitution from `run.env`.
+- No command accepts `--env-file` or implicit template rendering in this spec.
+- If `input/run.env` exists, commands may inventory it as an ignored ordinary user file and warn that it has no effect.
+- `croco.in` must be a real CROCO input file ready for the selected CROCO source version. It is not a template by default.
 
 ### Reporting policy
 
 Commands that analyze artifacts should apply this reporting order:
 
 1. Record compile-time findings from compile-related artifacts.
-2. Record runtime findings from runtime artifacts.
-3. Classify assets for staging and reporting.
-4. Apply user overrides where they clarify paths, staging, or ambiguity.
-5. Report warnings, ambiguities, contradictions, and possible semantic mismatches with evidence.
-6. Hard-fail only for infrastructural blockers by default.
+2. Record input evidence inventory.
+3. Record runtime materialization plan for workdir construction.
+4. Build a runtime execution plan from `cppdefs.h`, `param.h`, binary status, and Docker backend configuration.
+5. Record superficial runtime findings from `croco.in` without claiming universal CROCO semantic interpretation.
+6. Report warnings and suspicious findings with evidence.
+7. Hard-fail only for infrastructural blockers by default.
 
 Infrastructural blockers include:
 
 - missing primary artifacts needed for the command
 - unknown or unavailable registered compile source when compiling
 - inability to write metadata or reports
-- inability to construct the requested staging/mounting plan
-- missing runtime assets classified as required for staging or mounting
+- inability to construct the requested workdir or symlink plan
 - missing binary when running
+- symlink target outside the mounted `CROCO_EXPERIMENTS` tree
+- broken input symlink that cannot be resolved safely
 - Docker/backend failure
 - compile failure
 - run failure
+- inability to construct a supported runtime execution plan
+- unsupported compiled runtime backend such as MPI, MPI+OpenMP, OpenACC, XIOS, or OASIS
+- planned OpenMP thread count exceeding parsed `NPP`
 
 Possible semantic mismatches, contradictions, suspicious combinations, and ambiguities are findings by default. They may become hard failures only when an explicit strict policy is requested.
 
@@ -93,8 +148,8 @@ Recommended exit codes:
 - `0`: command completed successfully
 - `1`: general failure
 - `2`: invalid CLI usage or missing argument
-- `3`: missing primary required artifact or runtime asset required for staging/mounting
-- `4`: artifact parsing or metadata/reporting failure
+- `3`: missing primary required artifact or unsafe/missing file needed for workdir materialization
+- `4`: artifact parsing, metadata/reporting, or workdir preparation failure
 - `5`: optional strict-policy failure for warnings, ambiguity, contradiction, or possible semantic mismatch
 - `7`: Docker/backend failure
 - `8`: compile failure
@@ -246,10 +301,9 @@ Read-only.
 
 ## Optional strict flags
 
-Future optional strict flags may include:
+Optional strict flags may include:
 
-- `--strict`: fail on ambiguity, contradiction, or possible semantic mismatch.
-- `--fail-on-ambiguity`: fail when any asset classification remains ambiguous.
+- `--strict`: fail on warning, suspicious finding, contradiction, or possible semantic mismatch.
 - `--fail-on-warning`: fail when warnings are produced.
 - `--require-clean-dry-run`: require dry-run with no warnings before run.
 
@@ -278,10 +332,11 @@ When `--source <source_id>` is provided, import records the selected registered 
 - `--experiments-root <path>`: defaults to `CROCO_EXPERIMENTS`.
 - `--source <source_id>`: select a registered compile source for this experiment.
 - `--force`: recompute generated metadata even if a manifest already exists.
-- `--override <path>`: host-side override file for resolving ambiguity.
 - `--json`: emit machine-readable summary.
 - `--no-docker-check`: skip Docker availability check. Import itself should not require Docker execution.
-- `--strict`: optional future mode that fails on ambiguity, contradiction, or possible semantic mismatch.
+- `--strict`: optional mode that fails on warning, contradiction, or possible semantic mismatch.
+
+No `--env-file` or template-rendering option is part of this spec.
 
 ### Expected generated files/directories
 
@@ -301,7 +356,7 @@ Must not create or modify files inside `input/`.
 - `0`: import completed and manifest written, possibly with warnings.
 - `3`: `input/croco.in`, `input/cppdefs.h`, or `input/param.h` is missing.
 - `4`: artifact parsing, metadata writing, report generation, or `--source <source_id>` registry resolution failed enough that the builder cannot record the import attempt.
-- `5`: optional strict policy failed because warnings, ambiguity, contradiction, or possible semantic mismatch were found.
+- `5`: optional strict policy failed.
 
 ### Minimal user-visible diagnostics
 
@@ -311,7 +366,8 @@ The command must print:
 - detected primary artifacts
 - whether `input/analytical.F` exists and whether it appears relevant
 - selected registered compile source, if provided
-- count of required, optional, ignored, and ambiguous assets
+- NetCDF-like runtime data asset count discovered by input tree scan
+- ignored `run.env` warning, if present
 - warning and finding count
 - path to `metadata/manifest.json`
 - missing artifact summary, if any
@@ -343,7 +399,7 @@ Import must not modify `CROCO_EXPERIMENTS/sources/<source_id>/`; it only reads t
 
 ### Purpose
 
-Show current metadata, evidence, findings, warnings, asset inventory, and path mappings. Optionally recompute metadata from `input/`.
+Show current metadata, evidence, findings, runtime materialization policy, warnings, and source selection. Optionally recompute metadata from `input/`.
 
 ### Minimal arguments
 
@@ -354,10 +410,10 @@ Show current metadata, evidence, findings, warnings, asset inventory, and path m
 - `--experiments-root <path>`
 - `--recompute`: re-read `input/` artifacts and update manifest.
 - `--json`: emit manifest summary as JSON.
-- `--assets`: include full asset inventory.
+- `--assets`: include full input evidence inventory.
 - `--capabilities`: include detected compile-time findings and inferred capabilities.
 - `--mounts`: include host path to container path mappings.
-- `--strict`: optional future mode that fails on ambiguity, contradiction, or possible semantic mismatch during recompute.
+- `--strict`: optional mode that fails on warning or suspicious finding during recompute.
 
 ### Expected generated files/directories
 
@@ -384,10 +440,9 @@ The command must print:
 - manifest status and timestamp
 - compile-time findings summary
 - selected registered compile source, if present
-- runtime findings summary
-- asset classification counts
-- reporting status
-- warning, ambiguity, and possible mismatch summaries
+- runtime input contract summary
+- NetCDF-like runtime data asset count
+- warning and suspicious finding summaries
 - stale metadata warning if input artifacts changed since the manifest was generated
 
 ### Docker usage
@@ -426,12 +481,11 @@ There is no setup-level or global CROCO version/source selection.
 
 - `--experiments-root <path>`
 - `--clean`: clear generated build artifacts for this experiment before compiling.
-- `--override <path>`: host-side override file for staging or backend settings.
 - `--image <name-or-id>`: Docker image to use.
-- `--source <source_id>`: optional future override for the compile source used in this attempt.
+- `--source <source_id>`: optional override for the compile source used in this attempt.
 - `--jobs <n>`: build parallelism.
 - `--json`: emit machine-readable build summary.
-- `--strict`: optional future mode that fails before compile on warnings, ambiguity, contradiction, or possible semantic mismatch.
+- `--strict`: optional mode that fails before compile on warnings or suspicious findings.
 
 ### Expected generated files/directories
 
@@ -444,59 +498,44 @@ May create or update:
 - `build/logs/`
 - `build/output/`
 
-`build/stage/` may contain staged copies of code and configuration files needed for compilation. Runtime data assets such as `.nc` files must remain in `input/` and must not be duplicated into `build/`.
+Must not create or modify files inside `input/`.
+
+Must not copy NetCDF-like runtime data assets into `build/`.
 
 ### Exit code behavior
 
-- `0`: compile completed and binary/build output is host-visible.
-- `3`: required compile-time artifact is missing, no source is known for the experiment, or the selected registered source is missing.
-- `4`: metadata writing failure, report generation failure, or inability to construct the requested compile staging plan before Docker execution.
+- `0`: compile completed and binary/build product was produced.
+- `3`: primary compile artifacts or selected source are missing.
+- `4`: metadata, staging, or report generation failed.
 - `5`: optional strict policy failed before compile.
-- `7`: Docker backend failure.
-- `8`: CROCO compilation failed.
+- `7`: Docker/backend failure.
+- `8`: compile process failed.
 
 ### Minimal user-visible diagnostics
 
-The command must print:
-
-- Docker image used
-- experiment root and build directory
-- compile-time artifacts used
-- registered compile source used, including `source_id`, flavor, declared version, and installed host path
-- whether `analytical.F` was staged and why
-- warnings, ambiguities, contradictions, or possible semantic findings carried into the attempt
-- build log path
-- binary or build product path, if successful
-- failure category: missing artifact, staging, Docker, or compile failure
+The command must print experiment name, selected source id, Docker image, staged compile files, compile log path, binary path on success, and failure category on failure.
 
 ### Docker usage
 
-Docker is used. The user must not enter the container manually. Docker must mount the whole `CROCO_EXPERIMENTS` directory.
+Docker is used as backend. The whole `CROCO_EXPERIMENTS` tree is mounted. Registered source trees must be reachable inside the container through that mount.
 
 ### Existing binary requirement
 
-No existing binary is required. This command creates or updates the binary/build product.
+No existing binary is required before compile.
 
 ### Write permissions
 
-May modify:
+May modify `metadata/` and `build/`.
 
-- `metadata/`
-- `build/`
-
-Must not modify:
-
-- `input/`, except reading user-provided artifacts
-- `CROCO_EXPERIMENTS/sources/<source_id>/`, except reading registered source files as compile inputs
-- `runs/`, except possibly recording no run state
+Must not modify `input/` or registered source trees.
 
 ## `crocoexp dry-run <experiment_name>`
 
 ### Purpose
 
-Produce a traceable pre-execution report without performing a full model run.
+Produce a traceable pre-execution infrastructure report without performing a full model run.
 
-Dry-run is mainly infrastructural and artifact-based. It reports asset availability, staging/mounting mappings, binary status, Docker readiness, warnings, ambiguities, contradictions, and possible semantic mismatches. It does not prove the CROCO experiment is semantically valid.
+Dry-run is not a universal CROCO semantic validator. It does not parse `croco.in` to decide which data files are required. It reports whether CROCOEXP can construct the run workdir according to the runtime input contract.
 
 ### Minimal arguments
 
@@ -505,77 +544,79 @@ Dry-run is mainly infrastructural and artifact-based. It reports asset availabil
 ### Optional arguments
 
 - `--experiments-root <path>`
-- `--run-id <run_id>`: choose the run directory where reports are written.
-- `--override <path>`: host-side override file for resolving path or classification ambiguity.
-- `--image <name-or-id>`: Docker image to validate against.
-- `--no-docker`: perform host-only static reporting when possible.
-- `--json`: emit machine-readable dry-run summary.
-- `--strict`: optional future mode that fails on warnings, ambiguity, contradiction, or possible semantic mismatch.
+- `--run-id <run_id>`: use a specified dry-run id or planned run id.
+- `--image <name-or-id>`: Docker image to check/use in the plan.
+- `--json`: emit machine-readable report.
+- `--strict`: optional mode that fails on warnings or suspicious findings.
 
 ### Expected generated files/directories
 
-May create or update:
+May create:
 
-- `metadata/manifest.json`
-- `metadata/report.md`
 - `runs/<run_id>/reports/dry_run_report.md`
 - `runs/<run_id>/snapshots/`
+- `metadata/report.md`
+- `metadata/manifest.json`
 
-Snapshots may contain effective config/code artifacts for reproducibility. Runtime data assets such as `.nc` files remain canonical in `input/` and must be represented in snapshots by references, hashes, sizes, and mappings rather than copied.
-Snapshots should include the selected registered compile source reference when present, but should not copy the full source tree.
+Dry-run may construct a temporary or planned symlink plan for reporting, but it must not perform a full model run.
 
 ### Exit code behavior
 
-- `0`: dry-run report completed, possibly with warnings or possible semantic findings.
-- `3`: primary required artifact or runtime asset classified as required for staging/mounting is missing.
-- `4`: metadata/report generation failed or the requested staging/mounting plan cannot be constructed.
+- `0`: dry-run completed and no infrastructural blocker was found, possibly with warnings.
+- `3`: missing primary artifacts, missing binary, or unsafe/missing file needed for materialization.
+- `4`: metadata, report, snapshot, or materialization-plan generation failed.
 - `5`: optional strict policy failed.
-- `7`: Docker backend failure when Docker-backed readiness checks are requested.
+- `7`: Docker/backend readiness check failed when Docker-backed readiness is requested.
 
 ### Minimal user-visible diagnostics
 
 The command must print:
 
-- compile-time findings summary
-- selected registered compile source, if present
-- runtime findings summary
-- required, optional, ignored, and ambiguous asset lists with reasons
-- warning and possible mismatch summaries
-- host path to container path mappings for assets selected for staging/mounting
-- binary status
-- Docker command summary or backend-readiness summary
-- dry-run report path
+- experiment root
+- run id
+- binary presence
+- selected Docker image
+- input root
+- planned workdir
+- materialization policy: `copy_config_symlink_netcdf`
+- count and list of NetCDF-like files to symlink
+- unresolved `${...}` tokens in `croco.in`, if any
+- ignored `run.env` warning, if present
+- planned Docker working directory
+- report path
+- infrastructural blockers, if any
+- detected runtime backend symbols
+- parsed `NPP`, `NSUB_X`, `NSUB_E`, `NP_XI`, `NP_ETA`, and `NNODES` when available
+- planned runtime launch profile
+- planned `OMP_NUM_THREADS`, when OpenMP is active
+- unsupported runtime backend blockers, if any
 
-Dry-run must explicitly avoid assuming `GRD_FILE`, `INI_FILE`, and `FRC_FILE` are required unless artifact-level evidence indicates they must be staged or mounted for the attempted run.
+It must not print "Required Assets Selected For Staging/Mounting" as the primary contract. The primary contract is the input tree and symlink materialization plan.
 
 ### Docker usage
 
-Docker may be used for backend-aware checks. With `--no-docker`, dry-run may perform host-only static reporting and must say so in diagnostics.
+Docker is not required for a host-only dry-run. If a Docker-backed readiness check is performed, Docker is used only to verify backend readiness, image availability, binary visibility, and mount assumptions.
 
 ### Existing binary requirement
 
-Dry-run should report whether a binary exists. It should not require a binary unless policy says the dry-run must include binary-specific checks.
+Dry-run should report missing binary as a blocker for run readiness. It may still write a report.
 
 ### Write permissions
 
-May modify:
+May modify `metadata/` and create `runs/<run_id>/reports/` and `runs/<run_id>/snapshots/`.
 
-- `metadata/`
-- `runs/<run_id>/reports/`
-- `runs/<run_id>/snapshots/`
-
-Must not modify:
-
-- `input/`
-- `build/`, except reading binary status
+Must not modify `input/`.
 
 ## `crocoexp run <experiment_name>`
 
 ### Purpose
 
-Attempt CROCO execution through Docker and record the result.
+Execute CROCO through Docker using a run-local workdir constructed from the experiment input tree and selected compiled binary.
 
-Run uses the artifact-based experiment definition, staged build product, asset mappings, and generated metadata. It may proceed with warnings, ambiguities, contradictions, or possible semantic findings unless blocked by missing assets required for staging/mounting, missing binary, inability to construct the staging/mounting plan, Docker/backend failure, explicit strict policy, or CROCO execution failure.
+Run is an attempt. It may proceed after dry-run when metadata contains warnings or suspicious findings, unless there is an infrastructural blocker or explicit strict policy.
+
+Before launching Docker, `run` must construct and apply the runtime execution plan. For OpenMP binaries, it must pass `OMP_NUM_THREADS` explicitly to Docker and write the same hard assignment in `run_inside_docker.sh`. For unsupported launch profiles, it must fail before Docker execution.
+
 
 ### Minimal arguments
 
@@ -584,74 +625,82 @@ Run uses the artifact-based experiment definition, staged build product, asset m
 ### Optional arguments
 
 - `--experiments-root <path>`
-- `--run-id <run_id>`
-- `--override <path>`
-- `--image <name-or-id>`
-- `--require-dry-run`: require an existing dry-run report for the same effective manifest.
-- `--require-clean-dry-run`: optional strict policy requiring a dry-run with no warnings, ambiguities, contradictions, or possible semantic findings.
-- `--resume-from <restart_asset>`
+- `--run-id <run_id>`: choose a run id instead of generating one.
+- `--image <name-or-id>`: Docker image to use.
+- `--binary <path>`: explicit compiled binary path, defaulting to the experiment build output.
+- `--clean-work`: remove an existing run workdir before materialization.
 - `--json`: emit machine-readable run summary.
-- `--strict`: optional future mode that fails before run on warnings, ambiguity, contradiction, or possible semantic mismatch.
+- `--strict`: optional mode that fails before run on warnings or suspicious findings.
+
+No `--env-file` or template-rendering option is part of this spec.
 
 ### Expected generated files/directories
 
-Creates or updates:
+May create or update:
 
+- `runs/<run_id>/work/`
 - `runs/<run_id>/logs/`
 - `runs/<run_id>/output/`
 - `runs/<run_id>/snapshots/`
 - `runs/<run_id>/reports/`
 - `metadata/manifest.json`
-- `metadata/run_index.json`, if a run index is used
 
-Run outputs must never be written back into `input/`.
-Run snapshots should include the selected registered compile source reference when present, but should not copy the full source tree.
+Workdir contents must include:
+
+```text
+runs/<run_id>/work/croco
+runs/<run_id>/work/croco.in
+runs/<run_id>/work/<relative path to each NetCDF-like asset under input> -> relative symlink target
+```
+
+Must not create or modify files inside `input/`.
 
 ### Exit code behavior
 
-- `0`: run completed successfully.
-- `3`: primary required artifact, runtime asset required for staging/mounting, or required binary is missing.
-- `4`: metadata, staging/mounting plan construction, or pre-run reporting failed.
-- `5`: optional strict policy failed.
-- `7`: Docker backend failure.
-- `9`: CROCO run failed.
+- `0`: CROCO execution completed successfully.
+- `3`: missing primary runtime artifact, missing binary, or unsafe materialization input.
+- `4`: metadata, workdir, symlink, snapshot, or report generation failed.
+- `5`: optional strict policy failed before run.
+- `7`: Docker/backend failure.
+- `9`: CROCO execution failed.
 
 ### Minimal user-visible diagnostics
 
 The command must print:
 
+- experiment name
 - run id
-- Docker image used
-- binary/build product used
-- selected registered compile source, if present
-- selected asset mappings
-- warning and possible semantic finding summary
+- Docker image
+- workdir path
+- binary used
+- copied config files
+- NetCDF symlink count
+- ignored `run.env` warning, if present
 - log path
 - output path
-- snapshot path
 - final exit status
-
-Failure diagnostics must state whether the failure came from missing artifacts, missing binary, metadata/staging, strict policy, Docker, or CROCO execution.
 
 ### Docker usage
 
-Docker is used. The user must not enter the container manually. Docker mounts the whole `CROCO_EXPERIMENTS` directory.
+Docker is used as backend. The whole `CROCO_EXPERIMENTS` tree is mounted. The Docker working directory must be the container path corresponding to `runs/<run_id>/work/`.
 
 ### Existing binary requirement
 
-A binary/build product is required. If missing, the command fails with a diagnostic instructing that compile is needed.
+An existing binary is required.
 
 ### Write permissions
 
 May modify:
 
-- `metadata/`
+- `runs/<run_id>/work/`
 - `runs/<run_id>/logs/`
 - `runs/<run_id>/output/`
 - `runs/<run_id>/snapshots/`
 - `runs/<run_id>/reports/`
+- `metadata/manifest.json`
 
 Must not modify:
 
 - `input/`
-- `build/`, except reading the selected binary/build product
+- registered source trees
+- other experiments

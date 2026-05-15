@@ -4,7 +4,7 @@
 
 ### Experiment
 
-An experiment is the host-side unit of evidence, generated metadata, execution attempts, and outputs.
+An experiment is the host-side unit of evidence, generated metadata, execution attempts, prepared work directories, and outputs.
 
 It is rooted at:
 
@@ -17,7 +17,18 @@ It contains:
 - `input/`: canonical user-provided CROCO artifacts and runtime data assets.
 - `metadata/`: generated manifest, findings, reports, and command records.
 - `build/`: staged compile area and build outputs.
-- `runs/<run_id>/`: logs, outputs, snapshots, and reports for execution attempts.
+- `runs/<run_id>/`: logs, outputs, snapshots, reports, and run-local work directory.
+
+Expected run layout:
+
+```text
+CROCO_EXPERIMENTS/<experiment_name>/runs/<run_id>/
+  work/
+  output/
+  logs/
+  snapshots/
+  reports/
+```
 
 An experiment is not a hardcoded case. It is an artifact-backed workspace assembled from real files and recorded findings.
 
@@ -58,10 +69,58 @@ Normal workflow copies a source tree into `CROCO_EXPERIMENTS/sources/<source_id>
 - `cppdefs.h`
 - `param.h`
 - optional `analytical.F`
-- `.nc` and similar runtime data assets
+- NetCDF-like runtime data assets such as `.nc`, `.nc4`, `.cdf`
 - other user-provided files relevant to the experiment
 
-The builder may read, hash, stage, mount, or reference evidence in snapshots, but generated files must not be written into `input/`. Snapshots may copy config/code artifacts; runtime data assets remain in `input/` during normal workflow and are represented in snapshots by metadata such as path, mapping, size, and hash when practical.
+The builder may read, hash, snapshot, symlink, or reference evidence, but generated files must not be written into `input/`.
+
+Runtime data assets remain in `input/` during normal workflow. In run work directories they are represented by relative symbolic links, not copies.
+
+`run.env` is not a recognized evidence type. If a file named `run.env` exists under `input/`, it is recorded only as an ignored ordinary user file and must not be sourced, parsed, rendered, or applied.
+
+### Runtime data asset
+
+A runtime data asset is a user-provided file under `input/` that may be read by CROCO during execution. NetCDF-like runtime data assets are recognized by file extension, not by parsing `croco.in`.
+
+Default NetCDF-like extensions:
+
+- `.nc`
+- `.nc4`
+- `.cdf`
+
+Future implementations may allow extension configuration, but default behavior must not require a CROCO-version-specific parser.
+
+Runtime data asset records should include:
+
+- canonical host path under `input/`
+- relative path from `input/`
+- planned workdir symlink path
+- relative symlink target
+- exists
+- size and hash when practical
+- source: `input_tree_scan`
+- copy policy: `symlink_into_work`
+
+### Run work directory
+
+A run work directory is the per-run filesystem view from which CROCO is executed.
+
+It is located at:
+
+```text
+CROCO_EXPERIMENTS/<experiment_name>/runs/<run_id>/work/
+```
+
+The run work directory is generated. It must not be treated as user-provided evidence.
+
+It contains:
+
+- copied `croco.in`
+- selected binary as `croco` or an explicitly recorded binary name
+- symlinks to NetCDF-like runtime data assets preserving input-relative paths
+- optional copied runtime helper files when explicitly required by implementation policy
+
+The command must execute CROCO with current working directory set to the work directory. This makes `croco.in` relative paths resolve against the generated work tree.
 
 ### Compile-time findings
 
@@ -94,42 +153,81 @@ Primary input:
 
 - `input/croco.in`
 
-Findings may include:
+Runtime findings may include:
 
-- parsed runtime keys and values
-- referenced paths
-- inferred asset roles
-- host/container path mappings
-- warnings or ambiguous references
+- raw text properties of `croco.in`
+- unresolved template-looking tokens such as `${...}`
+- referenced-looking strings when cheaply detectable
+- warnings about likely portability issues
 
-Runtime findings are descriptive metadata. They do not prove that the runtime configuration is semantically compatible with the compiled model or scientifically valid. The run attempt and its logs are the authoritative record of what happened during execution.
+Runtime findings must not drive universal required-asset selection. `croco.in` is version-specific CROCO syntax, not universal CROCOEXP semantic truth.
+
+The run attempt and CROCO logs are the authoritative record of what happened during execution.
+
+### Runtime materialization plan
+
+The runtime materialization plan records how `input/` is exposed under `runs/<run_id>/work/`.
+
+Required fields:
+
+- input root
+- workdir root
+- binary source
+- binary destination
+- copied runtime config files
+- symlinked NetCDF-like runtime assets
+- skipped files
+- warnings
+- Docker working directory
+- Docker mounts
+
+The plan is infrastructural. It does not prove that CROCO will successfully read any file.
+
+### Runtime execution plan
+
+The runtime execution plan records how CROCOEXP intends to launch the compiled CROCO binary from the run work directory.
+
+It is derived from compile-time evidence, especially `input/cppdefs.h` and `input/param.h`, not from `input/croco.in`.
+
+It records:
+
+- detected launch-relevant symbols such as `OPENMP`, `MPI`, `OPENACC`, `XIOS`, `OASIS`, and `AGRIF`
+- parsed execution dimensions such as `NPP`, `NSUB_X`, `NSUB_E`, `NP_XI`, `NP_ETA`, and `NNODES`
+- selected launch profile: `serial`, `openmp`, `mpi`, `hybrid`, `openacc`, or `unsupported_complex`
+- environment variables controlled by CROCOEXP, especially `OMP_NUM_THREADS`
+- Docker `-e` variables needed for launch
+- wrapper command used to start CROCO
+- warnings and blockers for unsupported launch profiles
+
+The runtime execution plan is infrastructural. It does not prove that the CROCO configuration is scientifically correct or that the model will run successfully after launch.
 
 ### Assets
 
-Assets are host-side files referenced by the experiment or discovered in `input/`.
+Assets are host-side files discovered under `input/` or generated by CROCOEXP.
 
-Examples:
-
-- grid files
-- initial condition files
-- forcing files
-- climatology files
-- boundary files
-- restart files
-- tide files
-- bulk flux files
-- other files referenced by `croco.in` or supporting configuration
-
-Each asset record should include:
+Asset records should include:
 
 - host path
-- container path
-- role inferred from artifact-level evidence
-- classification: required, optional, ignored, or ambiguous
-- provenance explaining the classification
-- copy policy
+- relative path from input or generated root
+- role
+- provenance
+- exists
+- size/hash when practical
+- runtime materialization policy
+- generated vs user-provided status
 
-Asset classification is a reporting and staging/mounting aid for the current builder attempt. It should be conservative and evidence-based, but it is not a semantic proof of CROCO behavior.
+Asset roles include:
+
+- `primary_config`: `croco.in`, `cppdefs.h`, `param.h`
+- `optional_code`: `analytical.F`
+- `runtime_data`: NetCDF-like files under `input/`
+- `other_user_file`
+- `generated_work_file`
+- `generated_output`
+- `generated_report`
+- `generated_log`
+
+The old required/optional/ignored/ambiguous runtime asset classifier is not part of the default staging contract. It may be reintroduced only as an optional diagnostic profile, not as the default behavior.
 
 ### Docker backend
 
@@ -140,7 +238,8 @@ Responsibilities:
 - Use the selected Docker image.
 - Mount the whole `CROCO_EXPERIMENTS` directory.
 - Make registered compile sources under `CROCO_EXPERIMENTS/sources/` available to compile commands.
-- Run compile, dry-run support, and model execution commands.
+- Make the run work directory available to runtime commands.
+- Execute CROCO from the run work directory.
 - Return logs, exit codes, and generated outputs to host-side locations.
 
 Docker is not the experiment source of truth. Users must not need to enter the container manually.
@@ -155,7 +254,7 @@ The primary source of truth is the real CROCO experiment artifact set under `inp
 - `input/cppdefs.h`
 - `input/param.h`
 - optional `input/analytical.F`
-- runtime data assets referenced by the current builder workflow
+- runtime data assets under `input/`
 
 These files define what the user is asking the builder to manage and attempt. The builder records metadata derived from them, but metadata is not a replacement for the evidence.
 
@@ -166,13 +265,13 @@ Generated metadata records:
 - selected registered compile source for the experiment, when known
 - compile-time findings
 - runtime findings
-- asset inventory and classifications
-- host/container mappings
-- staging decisions
+- input evidence inventory
+- runtime materialization plan
+- symlink records
 - Docker backend details
 - command attempts
 - logs and reports produced
-- warnings, ambiguities, possible inconsistencies, and failures
+- warnings, possible inconsistencies, and failures
 
 Generated metadata supports traceability and diagnostics. It should be regenerable from `input/` and command history whenever possible.
 
@@ -193,109 +292,67 @@ It records:
 
 The registry is a source of truth for registered compile infrastructure, not for experiment science. It does not prove that a source tree is correct, complete, compatible with an experiment, or able to compile.
 
-### User overrides
-
-User overrides may be allowed for path mapping, backend settings, and explicit intent when artifact-level evidence is ambiguous.
-
-Overrides must:
-
-- be host-side
-- be recorded in metadata and snapshots
-- be visible in dry-run and run reports
-- not move `.nc` or similar runtime data out of `input/` during normal workflow
-
-Overrides resolve builder ambiguity; they do not prove scientific or semantic correctness.
-
 ## Compile-time truth vs runtime truth
 
-The builder preserves a distinction between compile-time evidence and runtime evidence.
+The builder preserves a distinction between compile-time evidence and runtime execution evidence.
 
 Compile-time findings answer: what did the compile-related artifacts appear to request or define?
 
-Examples:
+Runtime materialization answers: which files were made visible to CROCO in the run work directory?
 
-- Which CPP flags are present.
-- Which dimensions and model limits are present in `param.h`.
-- Which registered compile source was selected for this builder attempt.
-- Whether `analytical.F` is present and appears relevant.
-- Which files were staged for compilation.
+Runtime execution planning answers: how the compiled binary must be launched based on compile-time backend evidence.
 
-Runtime findings answer: what did `croco.in` and related runtime evidence appear to request?
-
-Examples:
-
-- Which paths are referenced.
-- Which runtime values are present.
-- Which restart, forcing, grid, boundary, or climatology files are named.
-- Which output cadence and output files are requested.
+Runtime findings answer: what superficial/runtime-artifact observations were recorded from `croco.in`.
 
 Rules:
 
-- Compile-time and runtime findings must be recorded separately.
-- The registered compile source selected for compilation must be recorded as compile-time traceability, separate from runtime findings.
-- The builder may compare them and report possible mismatches, contradictions, ambiguities, or suspicious combinations as findings.
+- Compile-time findings and runtime materialization records must be separate.
+- The registered compile source selected for compilation must be recorded as compile-time traceability.
+- Runtime data visibility is guaranteed by symlink materialization of input NetCDF-like files, not by semantic parsing of `croco.in`.
+- The builder may compare compile-time and runtime information and report suspicious combinations as findings.
 - The comparison is descriptive and diagnostic, not a theorem proving step.
-- Compile and run commands may proceed with reported warnings, ambiguities, contradictions, or possible mismatches unless blocked by missing primary artifacts, inability to write metadata, inability to construct the requested staging/mounting plan, missing binary for run, explicit strict policy, Docker/backend failure, compile failure, or run failure.
-- Dry-run must show the evidence behind builder-level file classifications, staging/mounting decisions, and warnings.
+- Runtime materialization and runtime execution planning must be recorded separately.
+- Compile and run commands may proceed with reported warnings or suspicious combinations unless blocked by an infrastructural blocker or explicit strict policy.
 
-## File classification rules
+## File materialization rules
 
-### Required
+### Copied into run workdir
 
-An external file is required when artifact-level evidence indicates the builder must stage or mount it to attempt the requested operation.
+- `input/croco.in`
+- selected compiled binary
+- small explicit runtime helper files if implementation policy requires them
 
-Examples:
+Copied files are generated run-local files. They do not replace canonical evidence.
 
-- `croco.in` contains a parser-recognized reference that the builder selects for staging or mounting in the run attempt.
-- A compile command needs `cppdefs.h`, `param.h`, or a staged source/config file.
-- A compile command needs a registered compile source selected by `compile_time.source_ref` or an explicit source option when supported.
-- A user-selected resume mode names a restart file that must be mounted.
+### Symlinked into run workdir
 
-Missing required files are infrastructural blockers because the builder cannot stage or mount what is absent.
+- NetCDF-like runtime data assets under `input/`
 
-Missing or unknown registered compile sources are infrastructural blockers for compile because the builder cannot construct the requested compile input plan. This is not a semantic judgment about CROCO or MSOT.
+Symlink requirements:
 
-### Optional
+- Preserve the path relative to `input/`.
+- Use relative symlink targets.
+- Targets must remain inside the mounted `CROCO_EXPERIMENTS` tree.
+- Do not create absolute host-path symlinks.
+- Do not copy large runtime data files during normal workflow.
+- Existing symlinks in `input/` that point outside `CROCO_EXPERIMENTS` are blockers unless explicitly allowed by future policy.
 
-An external file is optional when it may be relevant but its absence should not block the requested builder operation by default.
+### Ignored for behavior
 
-Examples:
+- `run.env`
+- unknown files that are not primary config, optional code, or recognized runtime data
 
-- A file reference that parser-level evidence does not select for staging or mounting.
-- A helper artifact that improves reporting but is not needed for staging.
-- A runtime reference whose relevance cannot be proven from artifact-level evidence and is not needed to form the execution attempt.
-
-Optional files should be reported with provenance.
-
-### Ignored
-
-An external file is ignored when artifact-level evidence suggests it is not selected for staging/mounting in the current builder attempt.
-
-Examples:
-
-- A placeholder path in `croco.in`.
-- A traditional key such as `GRD_FILE`, `INI_FILE`, or `FRC_FILE` that parser-level evidence does not select for the current attempt.
-- A file in `input/` that is not referenced by parsed artifacts.
-
-Ignored files should not be mounted as required inputs. They may still be listed as non-active evidence.
-
-### Ambiguous
-
-An asset is ambiguous when the builder cannot confidently classify it from artifact-level evidence.
-
-Ambiguous cases should:
-
-- be surfaced in dry-run output
-- include evidence and candidate interpretations
-- allow host-side user overrides when useful
-- remain warnings/findings by default unless an explicit strict policy treats them as blockers or the ambiguity prevents construction of the requested staging/mounting plan
+Ignored files may still be inventoried as user-provided files.
 
 ## Possible inconsistency reporting
 
-The builder may report possible inconsistencies, contradictions, or suspicious combinations, such as:
+The builder may report:
 
-- runtime references to a file that appears incompatible with detected compile-time flags
-- runtime references to a capability that may not be compiled in
-- analytical-looking compile evidence alongside external-data runtime references
+- unresolved `${...}` tokens in `croco.in`
+- presence of `run.env`, with note that it is ignored
+- NetCDF files present but no obvious references found
+- references that look like absolute host paths
+- config files that mention output paths under `input/`
+- compile/run suspicious combinations
 
-These are reported findings. They are not hard failures by default because the builder is not responsible for proving CROCO semantic compatibility. Commands should proceed unless an infrastructural blocker or explicit strict policy stops them.
+These are findings by default. They are not hard failures unless an explicit strict policy is selected or they prevent construction of the run work directory.

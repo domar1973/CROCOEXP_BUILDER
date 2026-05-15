@@ -9,12 +9,14 @@
 - Ensure users never need to enter the container manually for normal import, inspect, compile, dry-run, or run operations.
 - Preserve `CROCO_EXPERIMENTS/<experiment_name>/input/` as the canonical user-provided evidence folder.
 - Keep runtime data assets such as `.nc` files in `input/` during normal workflow.
-- Store generated metadata, build products, reports, logs, snapshots, and run outputs outside `input/`.
+- Expose NetCDF runtime data to model execution through relative symbolic links created in the run-local work directory.
+- Store generated metadata, build products, reports, logs, snapshots, work directories, symlink forests, and run outputs outside `input/`.
 - Support repo-level registered compile sources, selected per experiment, for official CROCO source trees, MSOT, custom forks, or patched source trees.
 - Store registered compile source trees under `CROCO_EXPERIMENTS/sources/<source_id>/` so Docker-backed compile operations can access them through the mounted `CROCO_EXPERIMENTS` tree.
-- Infer builder-relevant staging and mounting needs from artifacts without claiming CROCO-level semantic truth.
-- Record what was attempted, which inputs were used, how files were staged or mounted, what Docker did, what warnings were observed, and what failed.
-- Preserve reproducibility by snapshotting effective config/code artifacts, asset inventories, host/container path mappings, command context, and logs.
+- Treat `croco.in` as version-specific CROCO input, not as universal semantic truth for CROCOEXP.
+- Derive a runtime execution plan from compile-time evidence such as `cppdefs.h` and `param.h` so the compiled binary is launched with a compatible backend profile.
+- Record what was attempted, which inputs were used, how files were staged or symlinked, what Docker did, what warnings were observed, and what failed.
+- Preserve reproducibility by snapshotting effective config/code artifacts, runtime input inventories, symlink plans, command context, and logs.
 
 ## Non-goals
 
@@ -27,11 +29,18 @@
 - Do not use a global CROCO version variable as the main source of compile input truth.
 - Do not assume registered compile sources are only official CROCO versions; MSOT and custom forks are valid registered sources.
 - Do not use symlinks to host paths outside `CROCO_EXPERIMENTS` as the normal source installation mechanism.
+- Do not parse `croco.in` as a universal asset contract, because its syntax depends on the CROCO source version.
+- Do not perform universal CROCO semantic validation in `dry-run`.
+- Do not infer required runtime assets by recognizing version-specific keys such as `GRDNAME`, `grid:`, `initial:`, `FRCNAME`, or similar.
+- Do not source, render, substitute, or otherwise support `run.env`.
+- Do not provide backward compatibility for the previous parser-based runtime asset inference design.
 - Do not prove that compile-time directives are scientifically or technically correct.
 - Do not prove that a selected compile-time configuration will compile successfully before attempting compilation.
 - Do not prove that runtime configuration is semantically compatible with the compiled model before execution.
 - Do not determine whether an experiment is scientifically well-posed.
 - Do not make metadata a replacement for the user-provided artifacts in `input/`.
+- Do not treat `croco.in` as the source of runtime backend launch requirements such as OpenMP threads, MPI ranks, XIOS servers, OpenACC devices, or OASIS coupling launch profiles.
+- Do not silently launch binaries compiled with unsupported runtime backends such as MPI, MPI+OpenMP hybrid, OpenACC, XIOS, or OASIS.
 
 Scientific and semantic responsibility remains with the researcher and the surrounding copilot workflow. The builder is responsible for disciplined artifact management, execution attempts, traceability, and diagnostics.
 
@@ -45,23 +54,61 @@ Scientific and semantic responsibility remains with the researcher and the surro
 - Source registry state lives in `.crocoexp/sources.json`.
 - Compile source selection is per experiment and must be recorded in experiment metadata under compile-time traceability.
 - Generated files must be distinguishable from user-provided files and must live outside `input/`.
-- Runtime data assets such as `.nc` files remain in `input/` and are accessed through mount-path mapping or symlinks when needed.
+- Runtime data assets such as `.nc`, `.nc4`, and NetCDF-like files remain canonical in `input/`.
+- During `run`, NetCDF-like runtime data assets are materialized into `runs/<run_id>/work/` by relative symlinks that preserve their path relative to `input/`.
+- Symlink targets must be relative paths within the mounted `CROCO_EXPERIMENTS` tree, never absolute host paths.
+- Primary runtime config/code files needed by CROCO execution, especially `croco.in`, are copied into the run-local work directory as regular files.
 - Compile-time findings are recorded separately from runtime findings.
-- Asset classifications are reporting and staging aids for the current builder attempt, not proof that the CROCO experiment is semantically valid.
+- Runtime finding extraction is descriptive only; it must not determine the symlink forest required for execution.
 - Possible inconsistencies and ambiguities are reported with evidence.
 - Compile and run may be attempted when warnings, ambiguities, contradictions, or possible semantic inconsistencies exist, unless an infrastructural blocker exists or the user selects an explicit strict policy.
 - A dry-run must not require manual container entry and must not perform a full model run.
-- Runs must leave inspectable logs, outputs, reports, and snapshots on the host.
+- Runs must leave inspectable logs, outputs, reports, snapshots, and the prepared work directory on the host.
+- `run.env` is not a recognized artifact. If present, it is ignored as an ordinary user file and must not affect command behavior.
+- Runtime materialization and runtime execution planning are separate records.
+- Runtime materialization controls filesystem visibility under `runs/<run_id>/work/`.
+- Runtime execution planning controls how the binary is launched from that work directory.
+- If `OPENMP` is detected, CROCOEXP must set `OMP_NUM_THREADS` explicitly.
+- If `MPI`, `OPENACC`, `XIOS`, or `OASIS` are detected and no launch profile is implemented, run must fail before Docker execution with a clear infrastructural blocker.
 
-## Pain points of current design
+## Runtime input contract
 
-- The current design is too rigid because it assumes `GRD_FILE`, `INI_FILE`, and `FRC_FILE` are always required.
-- Experiments that use analytical definitions, climatology, restart files, boundary forcing, or other CROCO-supported modes do not fit a single fixed asset checklist.
-- Hardcoded cases make the system difficult to extend and easy to break when a real experiment differs from the expected template.
-- Required-file errors can be misleading when a file is only a placeholder, parser-level non-selected reference, or optional runtime asset for the current builder attempt.
-- Users are forced to reason about container internals instead of host-side experiment artifacts.
-- Compile source provenance is weak when source trees are selected by informal notes, container-local defaults, or scattered version variables.
-- Symlinked source trees outside `CROCO_EXPERIMENTS` can break inside Docker because only `CROCO_EXPERIMENTS` is mounted.
-- Compile-time and runtime concerns are blurred, making it unclear whether a failure came from missing evidence, staging, Docker, compilation, execution, or a CROCO-level issue.
-- Current validation language overreaches by implying the builder can prove compile/runtime semantic compatibility.
-- Reproducibility is weakened when effective artifacts, inferred findings, mounted assets, logs, and command attempts are not captured together.
+CROCOEXP guarantees filesystem visibility, not CROCO semantic interpretation.
+
+At run time, CROCOEXP creates:
+
+```text
+CROCO_EXPERIMENTS/<experiment_name>/runs/<run_id>/work/
+```
+
+The run-local `work/` directory is the execution working directory for CROCO. It contains:
+
+- a copied `croco.in`
+- the selected compiled binary, normally as `croco`
+- copied small config/code artifacts only when needed for traceability or runtime behavior
+- relative symlinks to NetCDF-like runtime data assets under `input/`, preserving each asset's path relative to `input/`
+
+Example:
+
+```text
+input/GRD/mesa_grd.nc
+input/INIT/mesa_ini.nc
+
+runs/<run_id>/work/GRD/mesa_grd.nc   -> ../../../../input/GRD/mesa_grd.nc
+runs/<run_id>/work/INIT/mesa_ini.nc  -> ../../../../input/INIT/mesa_ini.nc
+```
+
+The exact relative target must be computed from the symlink parent directory to the canonical file under `input/`.
+
+CROCOEXP does not need to know whether `croco.in` uses `grid:`, `GRDNAME ==`, or any other version-specific syntax. The researcher/copilot is responsible for writing `croco.in` so that its relative paths resolve from the run-local `work/` directory.
+
+## Pain points addressed by this design
+
+- Parser-based asset inference from `croco.in` is fragile across CROCO versions.
+- The previous design classified real files as ambiguous when the runtime key syntax was not recognized.
+- Required-file errors were misleading when the builder did not understand a particular CROCO input syntax.
+- Users were forced to reason about container internals instead of host-side experiment artifacts.
+- Runtime data staging depended on a universal semantic parser that cannot be correct for all CROCO/MSOT/custom forks.
+- Compile-time and runtime concerns were blurred, making it unclear whether a failure came from missing evidence, staging, Docker, compilation, execution, or a CROCO-level issue.
+- `run.env` created an implicit templating layer whose behavior was not guaranteed by CROCOEXP.
+- Reproducibility was weakened when effective artifacts, symlink plans, logs, and command attempts were not represented as a single runtime contract.

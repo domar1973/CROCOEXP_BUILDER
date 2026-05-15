@@ -2,9 +2,9 @@
 
 ## Purpose
 
-`crocoexp setup` is a future host-side bootstrap command for preparing the repo-level Docker execution backend.
+`crocoexp setup` is a host-side bootstrap command for preparing the repo-level Docker execution backend.
 
-The setup slice is infrastructure readiness only. It does not import experiments, compile CROCO, run CROCO, perform dry-run semantics, or validate scientific correctness. It records whether the host can use the configured Docker backend and which Docker image should be treated as the repo default.
+The setup slice is infrastructure readiness only. It does not import experiments, compile CROCO, run CROCO, perform dry-run semantics, prepare run workdirs, or validate scientific correctness. It records whether the host can use the configured Docker backend and which Docker image should be treated as the repo default.
 
 Setup does not choose a global CROCO source, CROCO version, MSOT tree, or custom source tree. Compile sources are registered separately with the source registry and selected per experiment.
 
@@ -18,6 +18,7 @@ The command should:
 - write a human-readable setup report
 - avoid requiring manual container entry
 - avoid touching any experiment `input/` directory
+- avoid touching run workdirs
 
 The builder remains host-side, infrastructure-oriented, traceability-oriented, and not a semantic validator of CROCO experiments.
 
@@ -30,6 +31,7 @@ The builder remains host-side, infrastructure-oriented, traceability-oriented, a
 - compile CROCO
 - run CROCO
 - implement dry-run or run behavior
+- create symlinks for runtime data
 - validate scientific correctness
 - validate compile/runtime semantic compatibility
 - prove that a future compile will succeed
@@ -40,6 +42,9 @@ The builder remains host-side, infrastructure-oriented, traceability-oriented, a
 - select a global registered compile source for all experiments
 - write `.crocoexp/sources.json`
 - copy source trees into `CROCO_EXPERIMENTS/sources/`
+- source or configure `run.env`
+- construct runtime execution plans
+- validate OpenMP/MPI/XIOS/OpenACC/OASIS launch compatibility
 
 ## Configuration Policy
 
@@ -67,7 +72,7 @@ Required `config.json` fields:
 - `last_setup_at`
 - `setup_status`
 
-`config.json` must not contain a global CROCO source id, global CROCO version, MSOT source id, or experiment compile source selection. Source registry state belongs in `.crocoexp/sources.json`.
+`config.json` must not contain a global CROCO source id, global CROCO version, MSOT source id, experiment compile source selection, runtime input path, or `run.env` configuration. Source registry state belongs in `.crocoexp/sources.json`.
 
 Recommended additional fields:
 
@@ -101,6 +106,8 @@ It should summarize Docker availability, daemon status, configured image, local 
 
 ## Canonical Image Policy
 
+The Docker image policy is independent from runtime execution planning. Setup records backend image readiness; `dry-run` and `run` decide launch profile compatibility from experiment compile-time evidence.
+
 There is one canonical default Docker image for the repo.
 
 The initial default should match the current builder convention unless changed by an explicit repo decision:
@@ -112,12 +119,12 @@ domarcroco/images-for-croco:base_croco_msot-1.0.0
 Rules:
 
 - `crocoexp setup` registers the current default image in `.crocoexp/config.json`.
-- `crocoexp compile`, future `crocoexp dry-run`, and future `crocoexp run` should use the configured default image unless the command receives an explicit `--image` override.
+- `crocoexp compile`, `crocoexp dry-run`, and `crocoexp run` should use the configured default image unless the command receives an explicit `--image` override.
 - The image reference must not be scattered across unrelated scripts, hardcoded wrappers, and informal docs.
 - If `--image <name-or-id>` is used, setup records that image as the repo default after successful checks or a successful pull.
 - A change from a previous default image is a warning by default, not a hard failure.
 
-The canonical image policy is independent from registered compile source policy. The Docker image describes the execution backend; the registered compile source describes compile input provenance for a specific experiment.
+The canonical image policy is independent from registered compile source policy and runtime input materialization policy. The Docker image describes the execution backend; the registered compile source describes compile input provenance for a specific experiment; run workdirs describe runtime filesystem visibility.
 
 ## CLI Contract
 
@@ -247,13 +254,14 @@ Expected result:
 - `setup_status` is `ready` or `ready_with_warnings`
 - `image_present_locally` is `true`
 - no experiment `input/` directories are modified
+- no run workdirs are created or modified
 
 Expected diagnostic summary:
 
 - Docker CLI detected
 - Docker daemon available
 - selected image present locally
-- backend ready for future compile attempts
+- backend ready for future compile/run attempts
 
 ### Docker present, image missing, no `--pull`
 
@@ -288,8 +296,8 @@ Initial setup:
 
 - Docker CLI is on `PATH`.
 - Docker daemon responds.
-- selected image is not present locally.
-- registry access succeeds.
+- selected image is missing locally.
+- network access and registry access are available.
 
 Command:
 
@@ -299,50 +307,32 @@ crocoexp setup --pull
 
 Expected result:
 
-- exit code `0`
-- image is pulled
-- `.crocoexp/config.json` records `image_pulled: true`
-- `setup_status` is `ready` or `ready_with_warnings`
+- exit code `0` if pull succeeds
+- config records selected image and `image_pulled: true`
+- setup report records pull command result
 - no experiment `input/` directories are modified
 
-Expected diagnostic summary:
-
-- selected image was missing
-- pull was attempted
-- pull succeeded
-- image is now registered as default
-
 ### Explicit `--image` override
-
-Initial setup:
-
-- Docker CLI and daemon are available.
-- user selects a non-default image.
 
 Command:
 
 ```text
-crocoexp setup --image <name-or-id> --pull
+crocoexp setup --image custom/image:tag --no-pull
 ```
 
 Expected result:
 
-- exit code `0` if image is present or pull succeeds
-- `.crocoexp/config.json` records `default_docker_image: <name-or-id>`
-- previous default image is recorded or mentioned in warnings when applicable
-- no experiment `input/` directories are modified
-
-Expected diagnostic summary:
-
-- selected image differs from the built-in canonical default or previous default
-- selected image is now the repo default
+- selected image is recorded if present locally
+- previous default image is reported if one existed
+- warning is recorded when the default changes
+- no source registry or experiment metadata is modified
 
 ### Inability to write setup config or report
 
 Initial setup:
 
-- Docker may or may not be available.
-- `.crocoexp/` or repo root is not writable.
+- Docker is ready.
+- `.crocoexp/` cannot be created or written.
 
 Command:
 
@@ -352,31 +342,25 @@ crocoexp setup
 
 Expected result:
 
-- exit code `4`
-- diagnostic names the path that could not be written
-- no experiment `input/` directories are modified
-
-Expected diagnostic summary:
-
-- setup could not persist repo-level backend state
-- failure category is `blocked_config_write`
+- non-zero exit
+- failure category `blocked_config_write`
+- diagnostic names the unwritable path
 
 ## Relationship To Other Commands
 
-- `crocoexp setup` prepares repo-level Docker backend readiness.
-- `crocoexp source install <path> --id <source_id>` registers repo-level compile source trees under `CROCO_EXPERIMENTS/sources/<source_id>/`.
-- `crocoexp import <experiment_name>` manages experiment evidence under `CROCO_EXPERIMENTS/<experiment_name>/input/` and writes experiment metadata.
-- `crocoexp import <experiment_name> --source <source_id>` records the experiment's selected registered compile source.
-- `crocoexp compile <experiment_name>` attempts a Docker-backed build using imported experiment artifacts, the experiment's registered compile source, and the configured default image unless the image is overridden.
-- `crocoexp dry-run <experiment_name>` reports execution preparation for an experiment.
-- `crocoexp run <experiment_name>` attempts execution through Docker.
-
-Setup is repo-level backend preparation, not experiment-level metadata. It must not modify experiment `input/` directories and must not create or update experiment manifests.
+- `crocoexp source install` is responsible for registering compile source trees.
+- `crocoexp import` records per-experiment source selection.
+- `crocoexp compile` uses the configured Docker backend and selected source.
+- `crocoexp dry-run` reports planned runtime workdir and symlink materialization.
+- `crocoexp run` creates the runtime workdir and symlinks NetCDF assets.
+- None of these commands should require manual container entry.
+- None of these commands should source `run.env`.
 
 ## Open Design Choices
 
-- Whether v1 should default to `--no-pull` or prompt before pulling when an image is missing.
-- Whether `--check-only` should write `.crocoexp/setup_report.md` or remain strictly read-only.
-- How compile should report image provenance when `.crocoexp/config.json` is absent and the built-in default image is used.
-- Whether `.crocoexp/config.json` should be committed to version control or treated as local machine state.
-- Whether strict setup policies are needed later for image digest pinning or approved image allowlists.
+Open design choices that remain outside setup:
+
+- Whether future versions support non-NetCDF runtime data symlink patterns.
+- Whether future versions add optional CROCO-version-specific semantic parsers.
+- Whether future versions add template rendering as an explicit command outside `run.env`.
+- Whether future versions optimize symlink materialization for very large nested data trees.

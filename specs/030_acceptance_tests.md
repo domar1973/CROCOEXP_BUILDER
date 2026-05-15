@@ -10,11 +10,13 @@ All tests assume:
 - Docker is only the execution backend
 - Docker mounts the whole `CROCO_EXPERIMENTS` directory
 - user-provided evidence lives under `CROCO_EXPERIMENTS/<experiment_name>/input/`
-- generated metadata, build products, reports, logs, snapshots, and outputs live outside `input/`
-- `.nc` and similar runtime data assets remain in `input/`
+- generated metadata, build products, workdirs, reports, logs, snapshots, and outputs live outside `input/`
+- `.nc`, `.nc4`, `.cdf`, and similar runtime data assets remain canonical in `input/`
+- NetCDF-like runtime data assets are exposed to CROCO by relative symlinks created in `runs/<run_id>/work/`
+- `croco.in` is treated as version-specific CROCO syntax and is not parsed as universal semantic truth
+- `run.env` is not supported and is ignored if present
 - the builder reports artifact-level findings but does not prove scientific or semantic correctness
 - only infrastructural blockers hard-fail by default
-- “required” means required for the builder’s staging/mounting plan, not proof of CROCO scientific necessity
 - registered compile sources live under `CROCO_EXPERIMENTS/sources/<source_id>/`
 - `.crocoexp/sources.json` records repo-level source registry state
 - compile source selection is per experiment, not a setup-level global version
@@ -35,11 +37,12 @@ CROCO_EXPERIMENTS/minimal/input/param.h
 crocoexp import minimal
 ```
 
-### Expected classification result
+### Expected result
 
 - Primary artifacts are classified as user-provided evidence.
-- Runtime assets referenced by `croco.in` are classified for reporting and staging.
-- No asset is required solely because it is named `GRD_FILE`, `INI_FILE`, or `FRC_FILE`.
+- No runtime data asset is required solely because of a key name in `croco.in`.
+- No semantic asset parser is required for success.
+- Metadata is generated outside `input/`.
 
 ### Expected generated paths
 
@@ -53,10 +56,6 @@ CROCO_EXPERIMENTS/minimal/runs/
 ### Expected success/failure
 
 Success with exit code `0`, possibly with warnings.
-
-### Expected diagnostic summary
-
-Diagnostics name the three primary artifacts, report asset classification counts, and state that metadata was generated outside `input/`.
 
 ## 2. Import experiment with optional `analytical.F`
 
@@ -75,26 +74,15 @@ CROCO_EXPERIMENTS/analytical_optional/input/analytical.F
 crocoexp import analytical_optional
 ```
 
-### Expected classification result
+### Expected result
 
 - `analytical.F` is recorded as present in `input/`.
 - Its status is recorded as appears relevant, staged candidate, not staged, or ambiguous.
 - Presence alone does not force analytical behavior or prove semantic correctness.
 
-### Expected generated paths
-
-```text
-CROCO_EXPERIMENTS/analytical_optional/metadata/manifest.json
-CROCO_EXPERIMENTS/analytical_optional/metadata/import_report.md
-```
-
 ### Expected success/failure
 
 Success with exit code `0`, unless primary artifact parsing fails.
-
-### Expected diagnostic summary
-
-Diagnostics explain what was observed about `analytical.F` and cite compile-time evidence.
 
 ## 3. Compile from host through Docker
 
@@ -105,11 +93,11 @@ CROCO_EXPERIMENTS/compile_ok/input/croco.in
 CROCO_EXPERIMENTS/compile_ok/input/cppdefs.h
 CROCO_EXPERIMENTS/compile_ok/input/param.h
 CROCO_EXPERIMENTS/compile_ok/metadata/manifest.json
-CROCO_EXPERIMENTS/sources/croco-v2.1.2/
+CROCO_EXPERIMENTS/sources/croco-v2.1.3/
 .crocoexp/sources.json
 ```
 
-The manifest contains `compile_time.source_ref.source_id: croco-v2.1.2`.
+The manifest contains `compile_time.source_ref.source_id: croco-v2.1.3`.
 
 ### Command invoked
 
@@ -117,7 +105,7 @@ The manifest contains `compile_time.source_ref.source_id: croco-v2.1.2`.
 crocoexp compile compile_ok
 ```
 
-### Expected classification result
+### Expected result
 
 - Compile-time artifacts are recorded as inputs to the attempt.
 - The compile source is resolved from `compile_time.source_ref`.
@@ -138,12 +126,7 @@ CROCO_EXPERIMENTS/compile_ok/metadata/compile_report.md
 
 Success with exit code `0` when Docker and CROCO compilation succeed. Failure uses exit code `7` for Docker/backend failure or `8` for compile failure.
 
-### Expected diagnostic summary
-
-Diagnostics show Docker image, compile artifacts used, staging decisions, build log path, generated binary/build product path on success, and no instruction requiring container entry.
-Diagnostics also show the registered source id and installed source path.
-
-## 4. Dry-run from host
+## 4. Dry-run reports version-agnostic runtime input contract
 
 ### Initial filesystem setup
 
@@ -151,7 +134,9 @@ Diagnostics also show the registered source id and installed source path.
 CROCO_EXPERIMENTS/dry_run_ok/input/croco.in
 CROCO_EXPERIMENTS/dry_run_ok/input/cppdefs.h
 CROCO_EXPERIMENTS/dry_run_ok/input/param.h
-CROCO_EXPERIMENTS/dry_run_ok/build/output/<binary>
+CROCO_EXPERIMENTS/dry_run_ok/input/GRD/grid.nc
+CROCO_EXPERIMENTS/dry_run_ok/input/INIT/init.nc
+CROCO_EXPERIMENTS/dry_run_ok/build/output/croco
 CROCO_EXPERIMENTS/dry_run_ok/metadata/manifest.json
 ```
 
@@ -161,11 +146,13 @@ CROCO_EXPERIMENTS/dry_run_ok/metadata/manifest.json
 crocoexp dry-run dry_run_ok
 ```
 
-### Expected classification result
+### Expected result
 
-- Required, optional, ignored, and ambiguous staging/mounting classifications are reported.
-- Assets selected for staging/mounting have host path to container path mappings.
-- Possible semantic mismatches, contradictions, and ambiguities are reported as findings, not hard failures by default.
+- Dry-run reports planned workdir.
+- Dry-run reports materialization policy `copy_config_symlink_netcdf`.
+- Dry-run lists `GRD/grid.nc` and `INIT/init.nc` as NetCDF-like runtime data assets to symlink.
+- Dry-run does not classify the assets as ambiguous merely because `croco.in` syntax is unknown.
+- Dry-run does not require a semantic parser for `croco.in`.
 
 ### Expected generated paths
 
@@ -177,13 +164,9 @@ CROCO_EXPERIMENTS/dry_run_ok/metadata/report.md
 
 ### Expected success/failure
 
-Success with exit code `0` when required artifacts/assets for staging/mounting are present, even if warnings are reported.
+Success with exit code `0` when primary artifacts and binary exist.
 
-### Expected diagnostic summary
-
-Diagnostics include binary status, asset classifications with reasons, warnings/findings, Docker or host-only reporting summary, and report path.
-
-## 5. Run from host through Docker
+## 5. Run creates workdir and NetCDF symlinks
 
 ### Initial filesystem setup
 
@@ -191,42 +174,44 @@ Diagnostics include binary status, asset classifications with reasons, warnings/
 CROCO_EXPERIMENTS/run_ok/input/croco.in
 CROCO_EXPERIMENTS/run_ok/input/cppdefs.h
 CROCO_EXPERIMENTS/run_ok/input/param.h
-CROCO_EXPERIMENTS/run_ok/build/output/<binary>
+CROCO_EXPERIMENTS/run_ok/input/GRD/grid.nc
+CROCO_EXPERIMENTS/run_ok/input/INIT/init.nc
+CROCO_EXPERIMENTS/run_ok/build/output/croco
 CROCO_EXPERIMENTS/run_ok/metadata/manifest.json
-CROCO_EXPERIMENTS/run_ok/runs/<run_id>/reports/dry_run_report.md
 ```
 
 ### Command invoked
 
 ```text
-crocoexp run run_ok --run-id <run_id>
+crocoexp run run_ok --run-id test_run
 ```
 
-### Expected classification result
+### Expected result
 
-- The run uses recorded metadata or refreshes artifact-level checks before execution.
-- Assets selected for mounting are mounted from `input/`.
-- Warnings or possible semantic findings may be carried into the run record.
-- No run output is classified as user input.
+- `runs/test_run/work/` is created.
+- `input/croco.in` is copied to `runs/test_run/work/croco.in`.
+- The binary is available as `runs/test_run/work/croco`.
+- `runs/test_run/work/GRD/grid.nc` is a relative symlink to `input/GRD/grid.nc`.
+- `runs/test_run/work/INIT/init.nc` is a relative symlink to `input/INIT/init.nc`.
+- Symlink targets resolve on the host.
+- Because Docker mounts the whole `CROCO_EXPERIMENTS` tree, the same relative symlinks resolve inside the container.
+- CROCO is executed with working directory set to the container path for `runs/test_run/work/`.
 
 ### Expected generated paths
 
 ```text
-CROCO_EXPERIMENTS/run_ok/runs/<run_id>/logs/
-CROCO_EXPERIMENTS/run_ok/runs/<run_id>/output/
-CROCO_EXPERIMENTS/run_ok/runs/<run_id>/snapshots/
-CROCO_EXPERIMENTS/run_ok/runs/<run_id>/reports/
+CROCO_EXPERIMENTS/run_ok/runs/test_run/work/
+CROCO_EXPERIMENTS/run_ok/runs/test_run/logs/
+CROCO_EXPERIMENTS/run_ok/runs/test_run/output/
+CROCO_EXPERIMENTS/run_ok/runs/test_run/snapshots/
+CROCO_EXPERIMENTS/run_ok/runs/test_run/reports/
 ```
 
 ### Expected success/failure
 
-Success with exit code `0` when required files exist, a binary exists, Docker execution succeeds, and CROCO exits successfully.
+Success with exit code `0` when Docker execution and CROCO execution succeed. Failure uses exit code `9` when CROCO exits non-zero.
 
-### Expected diagnostic summary
-
-Diagnostics show run id, Docker image, binary used, selected mappings, warnings/findings, log path, output path, snapshot path, and final exit status.
-
-## 6. Analytical-style experiment without external grid, init, or forcing files
+## 6. Analytical-style experiment without external NetCDF files
 
 ### Initial filesystem setup
 
@@ -235,9 +220,8 @@ CROCO_EXPERIMENTS/analytical_no_external/input/croco.in
 CROCO_EXPERIMENTS/analytical_no_external/input/cppdefs.h
 CROCO_EXPERIMENTS/analytical_no_external/input/param.h
 CROCO_EXPERIMENTS/analytical_no_external/input/analytical.F
+CROCO_EXPERIMENTS/analytical_no_external/build/output/croco
 ```
-
-`croco.in` may contain traditional file keys with placeholder values.
 
 ### Command invoked
 
@@ -245,72 +229,94 @@ CROCO_EXPERIMENTS/analytical_no_external/input/analytical.F
 crocoexp dry-run analytical_no_external
 ```
 
-### Expected classification result
+### Expected result
 
-- Analytical-looking compile-time findings are recorded.
-- Placeholder or parser-level non-selected `GRD_FILE`, `INI_FILE`, and `FRC_FILE` references are classified as ignored, optional, or ambiguous, not required by name alone.
+- Analytical-looking compile-time findings may be recorded.
+- No external grid, initial condition, or forcing file is required by CROCOEXP.
+- NetCDF symlink count is zero.
 - The report does not claim scientific or semantic correctness.
-
-### Expected generated paths
-
-```text
-CROCO_EXPERIMENTS/analytical_no_external/metadata/manifest.json
-CROCO_EXPERIMENTS/analytical_no_external/runs/<run_id>/reports/dry_run_report.md
-```
 
 ### Expected success/failure
 
 Success with exit code `0` if no infrastructural blocker exists.
 
-### Expected diagnostic summary
-
-Diagnostics explain why external grid, initial condition, and forcing files were not classified as required for staging/mounting by artifact-level classification.
-
-## 7. External-data experiment with grid, init, and forcing files
+## 7. External-data experiment with CROCO v2.1-style `croco.in`
 
 ### Initial filesystem setup
 
 ```text
-CROCO_EXPERIMENTS/external_data/input/croco.in
-CROCO_EXPERIMENTS/external_data/input/cppdefs.h
-CROCO_EXPERIMENTS/external_data/input/param.h
-CROCO_EXPERIMENTS/external_data/input/grid.nc
-CROCO_EXPERIMENTS/external_data/input/init.nc
-CROCO_EXPERIMENTS/external_data/input/forcing.nc
+CROCO_EXPERIMENTS/external_new/input/croco.in
+CROCO_EXPERIMENTS/external_new/input/cppdefs.h
+CROCO_EXPERIMENTS/external_new/input/param.h
+CROCO_EXPERIMENTS/external_new/input/GRD/mesa_grd.nc
+CROCO_EXPERIMENTS/external_new/input/INIT/mesa_ini.nc
+CROCO_EXPERIMENTS/external_new/build/output/croco
 ```
 
-`croco.in` references the three `.nc` assets in a way the builder classifies as required for staging/mounting in the run attempt.
+`croco.in` uses syntax such as:
+
+```text
+grid: filename
+GRD/mesa_grd.nc
+
+initial: NRREC filename
+0
+INIT/mesa_ini.nc
+```
 
 ### Command invoked
 
 ```text
-crocoexp dry-run external_data
+crocoexp dry-run external_new
 ```
 
-### Expected classification result
+### Expected result
 
-- `grid.nc` is classified as required for staging/mounting.
-- `init.nc` is classified as required for staging/mounting.
-- `forcing.nc` is classified as required for staging/mounting.
-- All data assets classified as required have host path to container path mappings.
-- All data assets classified as required use copy policy `remain_in_input`.
-
-### Expected generated paths
-
-```text
-CROCO_EXPERIMENTS/external_data/metadata/manifest.json
-CROCO_EXPERIMENTS/external_data/runs/<run_id>/reports/dry_run_report.md
-```
+- Dry-run succeeds without needing to understand `grid:` or `initial:`.
+- Both `.nc` files are planned for symlink materialization because they exist under `input/`.
+- No asset is reported as ambiguous due to unrecognized CROCO keywords.
 
 ### Expected success/failure
 
 Success with exit code `0`.
 
-### Expected diagnostic summary
+## 8. External-data experiment with older `GRDNAME`-style `croco.in`
 
-Diagnostics identify each external asset classified as required for staging/mounting and cite the runtime references and artifact-level evidence.
+### Initial filesystem setup
 
-## 8. Referenced assets remain in `input/`
+```text
+CROCO_EXPERIMENTS/external_old/input/croco.in
+CROCO_EXPERIMENTS/external_old/input/cppdefs.h
+CROCO_EXPERIMENTS/external_old/input/param.h
+CROCO_EXPERIMENTS/external_old/input/GRD/grid.nc
+CROCO_EXPERIMENTS/external_old/input/INIT/init.nc
+CROCO_EXPERIMENTS/external_old/build/output/croco
+```
+
+`croco.in` uses syntax such as:
+
+```text
+GRDNAME == GRD/grid.nc
+ININAME == INIT/init.nc
+```
+
+### Command invoked
+
+```text
+crocoexp dry-run external_old
+```
+
+### Expected result
+
+- Dry-run succeeds without needing to understand `GRDNAME` or `ININAME`.
+- Both `.nc` files are planned for symlink materialization.
+- Runtime syntax differences do not affect staging.
+
+### Expected success/failure
+
+Success with exit code `0`.
+
+## 9. Referenced assets remain canonical in `input/`
 
 ### Initial filesystem setup
 
@@ -319,40 +325,27 @@ CROCO_EXPERIMENTS/assets_in_input/input/croco.in
 CROCO_EXPERIMENTS/assets_in_input/input/cppdefs.h
 CROCO_EXPERIMENTS/assets_in_input/input/param.h
 CROCO_EXPERIMENTS/assets_in_input/input/grid.nc
+CROCO_EXPERIMENTS/assets_in_input/build/output/croco
 ```
-
-`croco.in` references `grid.nc`.
 
 ### Command invoked
 
 ```text
-crocoexp dry-run assets_in_input
+crocoexp run assets_in_input --run-id test_run
 ```
 
-### Expected classification result
+### Expected result
 
-- `grid.nc` is classified as required, optional, ignored, or ambiguous according to artifact-level evidence.
-- If selected for staging/mounting, its canonical host path remains under `input/`.
-- The manifest records host path to container path mapping.
-
-### Expected generated paths
-
-```text
-CROCO_EXPERIMENTS/assets_in_input/metadata/manifest.json
-CROCO_EXPERIMENTS/assets_in_input/runs/<run_id>/reports/dry_run_report.md
-```
-
-No copy of `grid.nc` is expected under `build/`, `metadata/`, or `runs/`.
+- `input/grid.nc` remains in `input/`.
+- `runs/test_run/work/grid.nc` is a symlink, not a copy.
+- No copy of `grid.nc` is created under `build/`, `metadata/`, `runs/test_run/snapshots/`, or `runs/test_run/output/`.
+- Manifest records the symlink relationship.
 
 ### Expected success/failure
 
-Success if the asset exists when classified as required for staging/mounting and no other infrastructural blocker exists.
+Success when CROCO exits successfully; otherwise run failure with logs preserved.
 
-### Expected diagnostic summary
-
-Diagnostics state that the data asset remains in `input/` and is accessed through Docker mount mapping.
-
-## 9. Build stages config/code files but leaves `.nc` data in `input/`
+## 10. Build stages config/code files but leaves `.nc` data in `input/`
 
 ### Initial filesystem setup
 
@@ -370,150 +363,108 @@ CROCO_EXPERIMENTS/stage_policy/input/grid.nc
 crocoexp compile stage_policy
 ```
 
-### Expected classification result
+### Expected result
 
 - Compile-relevant config/code files may be staged into `build/stage/`.
 - `grid.nc` remains only in `input/`.
-- Manifest records `grid.nc` with copy policy `remain_in_input`.
-
-### Expected generated paths
-
-```text
-CROCO_EXPERIMENTS/stage_policy/build/stage/
-CROCO_EXPERIMENTS/stage_policy/build/logs/
-CROCO_EXPERIMENTS/stage_policy/build/output/
-```
+- Manifest records `grid.nc` with materialization policy `symlink_into_workdir`.
 
 ### Expected success/failure
 
 Success with exit code `0` if Docker and compilation succeed.
 
-### Expected diagnostic summary
-
-Diagnostics list staged compile files and explicitly state that runtime data files were not duplicated.
-
-## 10. Possible compile/runtime mismatch is reported, not blocked by default
+## 11. `run.env` is ignored
 
 ### Initial filesystem setup
 
 ```text
-CROCO_EXPERIMENTS/possible_mismatch/input/croco.in
-CROCO_EXPERIMENTS/possible_mismatch/input/cppdefs.h
-CROCO_EXPERIMENTS/possible_mismatch/input/param.h
-CROCO_EXPERIMENTS/possible_mismatch/input/forcing.nc
+CROCO_EXPERIMENTS/run_env_ignored/input/croco.in
+CROCO_EXPERIMENTS/run_env_ignored/input/cppdefs.h
+CROCO_EXPERIMENTS/run_env_ignored/input/param.h
+CROCO_EXPERIMENTS/run_env_ignored/input/run.env
+CROCO_EXPERIMENTS/run_env_ignored/input/grid.nc
+CROCO_EXPERIMENTS/run_env_ignored/build/output/croco
 ```
 
-`croco.in` requests an external forcing file. Compile-time findings appear analytical or do not clearly show the corresponding capability.
+`run.env` contains values that would change paths if sourced.
 
 ### Command invoked
 
 ```text
-crocoexp dry-run possible_mismatch
+crocoexp dry-run run_env_ignored
 ```
 
-### Expected classification result
+### Expected result
 
-- The forcing reference is recorded.
-- Metadata records a possible mismatch with compile-time and runtime evidence.
-- The finding is reported as a warning by default.
-
-### Expected generated paths
-
-```text
-CROCO_EXPERIMENTS/possible_mismatch/metadata/manifest.json
-CROCO_EXPERIMENTS/possible_mismatch/metadata/report.md
-CROCO_EXPERIMENTS/possible_mismatch/runs/<run_id>/reports/dry_run_report.md
-```
+- `run.env` is recorded as ignored.
+- No value from `run.env` appears in the materialization plan unless it also appears in real evidence independently.
+- Diagnostic warning states that `run.env` is unsupported and has no effect.
+- No command attempts to source or parse `run.env`.
 
 ### Expected success/failure
 
-Success with exit code `0` if assets classified as required for staging/mounting exist and no infrastructural blocker exists. With explicit `--strict`, failure with exit code `5` is acceptable.
+Success with exit code `0`, possibly with warning.
 
-### Expected diagnostic summary
-
-Diagnostics cite the runtime request, the compile-time finding, and state that this is a reported possible mismatch, not a default hard blocker.
-
-## 11. Ambiguous asset classification is reported
+## 12. Unresolved template tokens are warnings only
 
 ### Initial filesystem setup
 
 ```text
-CROCO_EXPERIMENTS/ambiguous/input/croco.in
-CROCO_EXPERIMENTS/ambiguous/input/cppdefs.h
-CROCO_EXPERIMENTS/ambiguous/input/param.h
-CROCO_EXPERIMENTS/ambiguous/input/data.nc
+CROCO_EXPERIMENTS/template_tokens/input/croco.in
+CROCO_EXPERIMENTS/template_tokens/input/cppdefs.h
+CROCO_EXPERIMENTS/template_tokens/input/param.h
+CROCO_EXPERIMENTS/template_tokens/input/grid.nc
+CROCO_EXPERIMENTS/template_tokens/build/output/croco
 ```
 
-The artifacts reference `data.nc` in a way that could map to more than one builder-level role, or parser evidence cannot determine whether the reference should be selected for staging/mounting.
+`croco.in` contains `${GRD_FILE}`.
 
 ### Command invoked
 
 ```text
-crocoexp dry-run ambiguous
+crocoexp dry-run template_tokens
 ```
 
-### Expected classification result
+### Expected result
 
-- `data.nc` is classified as ambiguous.
-- Manifest records candidate interpretations and recommended resolution.
-- No silent guess is made.
-
-### Expected generated paths
-
-```text
-CROCO_EXPERIMENTS/ambiguous/metadata/manifest.json
-CROCO_EXPERIMENTS/ambiguous/runs/<run_id>/reports/dry_run_report.md
-```
+- Dry-run reports unresolved template token `${GRD_FILE}` as a warning.
+- No substitution is performed.
+- NetCDF files under `input/` are still included in the symlink plan.
+- Dry-run does not fail by default.
 
 ### Expected success/failure
 
-Success with exit code `0` if the ambiguity does not prevent construction of the requested staging/mounting plan. With explicit `--strict`, failure with exit code `5` is acceptable.
+Success with exit code `0`; with explicit `--strict`, failure with exit code `5` is acceptable.
 
-### Expected diagnostic summary
-
-Diagnostics explain the ambiguity, show evidence, and indicate that a host-side override or artifact correction can clarify it.
-
-## 12. Missing required asset with precise diagnostic
+## 13. Unsafe symlink target outside `CROCO_EXPERIMENTS` blocks run
 
 ### Initial filesystem setup
 
 ```text
-CROCO_EXPERIMENTS/missing_asset/input/croco.in
-CROCO_EXPERIMENTS/missing_asset/input/cppdefs.h
-CROCO_EXPERIMENTS/missing_asset/input/param.h
+CROCO_EXPERIMENTS/unsafe_link/input/croco.in
+CROCO_EXPERIMENTS/unsafe_link/input/cppdefs.h
+CROCO_EXPERIMENTS/unsafe_link/input/param.h
+CROCO_EXPERIMENTS/unsafe_link/input/external.nc -> /tmp/external.nc
+CROCO_EXPERIMENTS/unsafe_link/build/output/croco
 ```
-
-`croco.in` references `forcing.nc` in a way the builder classifies as required for staging/mounting in the attempted run, but `input/forcing.nc` does not exist.
 
 ### Command invoked
 
 ```text
-crocoexp dry-run missing_asset
+crocoexp dry-run unsafe_link
 ```
 
-### Expected classification result
+### Expected result
 
-- `forcing.nc` is classified as required for staging/mounting.
-- Manifest records `exists: false`.
-- Reporting status records `blocked_missing_artifact`.
-
-### Expected generated paths
-
-```text
-CROCO_EXPERIMENTS/missing_asset/metadata/manifest.json
-CROCO_EXPERIMENTS/missing_asset/metadata/report.md
-CROCO_EXPERIMENTS/missing_asset/runs/<run_id>/reports/dry_run_report.md
-```
+- The input symlink is detected.
+- Its resolved target is outside `CROCO_EXPERIMENTS`.
+- The materialization plan is blocked because the target would not be guaranteed visible inside Docker.
 
 ### Expected success/failure
 
-Failure with exit code `3`.
+Failure with exit code `3` or `4`, with precise diagnostic.
 
-### Expected diagnostic summary
-
-Diagnostics name `forcing.nc`, show the expected host path under `input/`, cite the `croco.in` key that led to the staging/mounting classification, and identify the failure as a missing required artifact.
-
-## 13. Successful run writes outputs outside `input/`
+## 14. Successful run writes outputs outside `input/`
 
 ### Initial filesystem setup
 
@@ -522,46 +473,32 @@ CROCO_EXPERIMENTS/output_policy/input/croco.in
 CROCO_EXPERIMENTS/output_policy/input/cppdefs.h
 CROCO_EXPERIMENTS/output_policy/input/param.h
 CROCO_EXPERIMENTS/output_policy/input/grid.nc
-CROCO_EXPERIMENTS/output_policy/input/init.nc
-CROCO_EXPERIMENTS/output_policy/input/forcing.nc
-CROCO_EXPERIMENTS/output_policy/build/output/<binary>
+CROCO_EXPERIMENTS/output_policy/build/output/croco
 ```
 
 ### Command invoked
 
 ```text
-crocoexp run output_policy
+crocoexp run output_policy --run-id test_run
 ```
 
-### Expected classification result
+### Expected result
 
 - Input data assets remain canonical under `input/`.
 - Generated run outputs are classified as generated output, not user evidence.
+- Outputs are written under `runs/test_run/output/` or collected there after execution.
+- No generated output is written to `input/`.
 
 ### Expected generated paths
 
 ```text
-CROCO_EXPERIMENTS/output_policy/runs/<run_id>/logs/
-CROCO_EXPERIMENTS/output_policy/runs/<run_id>/output/
-CROCO_EXPERIMENTS/output_policy/runs/<run_id>/snapshots/
-CROCO_EXPERIMENTS/output_policy/runs/<run_id>/reports/
+CROCO_EXPERIMENTS/output_policy/runs/test_run/logs/
+CROCO_EXPERIMENTS/output_policy/runs/test_run/output/
+CROCO_EXPERIMENTS/output_policy/runs/test_run/snapshots/
+CROCO_EXPERIMENTS/output_policy/runs/test_run/reports/
 ```
 
-No generated output is expected under:
-
-```text
-CROCO_EXPERIMENTS/output_policy/input/
-```
-
-### Expected success/failure
-
-Success with exit code `0` if Docker and CROCO execution succeed.
-
-### Expected diagnostic summary
-
-Diagnostics show log and output paths under `runs/<run_id>/` and confirm no output was written to `input/`.
-
-## 14. Reproducibility snapshot includes effective config and asset inventory
+## 15. Reproducibility snapshot includes effective config and symlink inventory
 
 ### Initial filesystem setup
 
@@ -569,125 +506,119 @@ Diagnostics show log and output paths under `runs/<run_id>/` and confirm no outp
 CROCO_EXPERIMENTS/snapshot_ok/input/croco.in
 CROCO_EXPERIMENTS/snapshot_ok/input/cppdefs.h
 CROCO_EXPERIMENTS/snapshot_ok/input/param.h
-CROCO_EXPERIMENTS/snapshot_ok/input/analytical.F
-CROCO_EXPERIMENTS/snapshot_ok/input/grid.nc
-CROCO_EXPERIMENTS/snapshot_ok/build/output/<binary>
+CROCO_EXPERIMENTS/snapshot_ok/input/GRD/grid.nc
+CROCO_EXPERIMENTS/snapshot_ok/build/output/croco
 ```
 
 ### Command invoked
 
 ```text
-crocoexp run snapshot_ok
+crocoexp run snapshot_ok --run-id test_run
 ```
 
-### Expected classification result
+### Expected result
 
-- Effective config/code artifacts are included in the snapshot.
-- Asset inventory selected for staging/mounting is included in the snapshot.
-- Runtime data assets are represented by path, mapping, size, and hash when practical, not duplicated.
-
-### Expected generated paths
-
-```text
-CROCO_EXPERIMENTS/snapshot_ok/runs/<run_id>/snapshots/croco.in
-CROCO_EXPERIMENTS/snapshot_ok/runs/<run_id>/snapshots/cppdefs.h
-CROCO_EXPERIMENTS/snapshot_ok/runs/<run_id>/snapshots/param.h
-CROCO_EXPERIMENTS/snapshot_ok/runs/<run_id>/snapshots/analytical.F
-CROCO_EXPERIMENTS/snapshot_ok/runs/<run_id>/snapshots/manifest.json
-CROCO_EXPERIMENTS/snapshot_ok/runs/<run_id>/snapshots/asset_inventory.json
-```
-
-`analytical.F` is expected only when staged or used by the effective workflow.
+- Snapshot includes copied `croco.in`, `cppdefs.h`, and `param.h`.
+- Snapshot includes selected source reference and binary reference.
+- Snapshot includes symlink inventory for `GRD/grid.nc`.
+- Snapshot records size and hash of `grid.nc` when practical.
+- Snapshot does not copy `grid.nc`.
 
 ### Expected success/failure
 
-Success with exit code `0` if Docker and CROCO execution succeed.
+Success when CROCO exits successfully; otherwise run failure with snapshot preserved if practical.
 
-### Expected diagnostic summary
-
-Diagnostics show snapshot path and confirm the snapshot contains effective configuration, asset inventory, Docker image identifier, command summary, and host path to container path mappings.
-
-## 15. Source install for official CROCO tree
+## 16. Possible compile/runtime mismatch is reported, not blocked by default
 
 ### Initial filesystem setup
 
 ```text
-/tmp/source_origins/croco-v2.1.2/
-CROCO_EXPERIMENTS/
+CROCO_EXPERIMENTS/possible_mismatch/input/croco.in
+CROCO_EXPERIMENTS/possible_mismatch/input/cppdefs.h
+CROCO_EXPERIMENTS/possible_mismatch/input/param.h
+CROCO_EXPERIMENTS/possible_mismatch/input/forcing.nc
+CROCO_EXPERIMENTS/possible_mismatch/build/output/croco
 ```
 
-The origin path contains a plausible CROCO source tree.
+`croco.in` appears to request an external forcing file. Compile-time findings appear analytical or do not clearly show the corresponding capability.
 
 ### Command invoked
 
 ```text
-crocoexp source install /tmp/source_origins/croco-v2.1.2 --id croco-v2.1.2 --flavor croco --declared-version v2.1.2
+crocoexp dry-run possible_mismatch
 ```
 
-### Expected classification result
+### Expected result
 
-- The source is registered as compile infrastructure.
-- The source is not treated as experiment `input/` evidence.
-- No semantic claim is made about whether this source can compile a given experiment.
-
-### Expected generated paths
-
-```text
-CROCO_EXPERIMENTS/sources/croco-v2.1.2/
-.crocoexp/sources.json
-```
+- Metadata may record a possible mismatch with compile-time and runtime evidence.
+- The finding is reported as a warning by default.
+- `forcing.nc` is included in the symlink plan because it is a NetCDF-like file under `input/`.
+- The finding does not block dry-run by default.
 
 ### Expected success/failure
 
-Success with exit code `0` if copy and registry writing succeed.
+Success with exit code `0`. With explicit `--strict`, failure with exit code `5` is acceptable.
 
-### Expected diagnostic summary
-
-Diagnostics show source id, flavor, declared version, origin path, installed path, and registry path.
-
-## 16. Source install for MSOT tree
+## 17. Source install for official CROCO tree
 
 ### Initial filesystem setup
 
 ```text
-/tmp/source_origins/msot-main/
-CROCO_EXPERIMENTS/
+/tmp/croco-v2.1.3/
 ```
+
+The source tree exists and is readable.
 
 ### Command invoked
 
 ```text
-crocoexp source install /tmp/source_origins/msot-main --id msot-main --flavor msot
+crocoexp source install /tmp/croco-v2.1.3 --id croco-v2.1.3 --flavor croco --declared-version v2.1.3
 ```
 
-### Expected classification result
+### Expected result
 
-- The source is registered with flavor `msot`.
-- MSOT is accepted as a registered compile source, not forced into an official CROCO version category.
-
-### Expected generated paths
-
-```text
-CROCO_EXPERIMENTS/sources/msot-main/
-.crocoexp/sources.json
-```
+- Source tree is copied under `CROCO_EXPERIMENTS/sources/croco-v2.1.3/`.
+- `.crocoexp/sources.json` records the source id and metadata.
+- No experiment `input/` directory is modified.
 
 ### Expected success/failure
 
-Success with exit code `0` if copy and registry writing succeed.
+Success with exit code `0`.
 
-### Expected diagnostic summary
-
-Diagnostics show that MSOT is registered as compile infrastructure and not as global setup state.
-
-## 17. Source list returns registered IDs
+## 18. Source install for MSOT tree
 
 ### Initial filesystem setup
 
 ```text
+/tmp/msot-source/
+```
+
+The source tree exists and is readable.
+
+### Command invoked
+
+```text
+crocoexp source install /tmp/msot-source --id msot-local --flavor msot
+```
+
+### Expected result
+
+- Source tree is copied under `CROCO_EXPERIMENTS/sources/msot-local/`.
+- Registry records flavor `msot`.
+- No global CROCO version is selected.
+
+### Expected success/failure
+
+Success with exit code `0`.
+
+## 19. Source list returns registered IDs
+
+### Initial filesystem setup
+
+```text
+CROCO_EXPERIMENTS/sources/croco-v2.1.3/
+CROCO_EXPERIMENTS/sources/msot-local/
 .crocoexp/sources.json
-CROCO_EXPERIMENTS/sources/croco-v2.1.2/
-CROCO_EXPERIMENTS/sources/msot-main/
 ```
 
 ### Command invoked
@@ -696,95 +627,68 @@ CROCO_EXPERIMENTS/sources/msot-main/
 crocoexp source list
 ```
 
-### Expected classification result
+### Expected result
 
-- Registered sources are listed by `source_id`.
-- No experiment metadata is modified.
-
-### Expected generated paths
-
-No generated paths.
+- Both source IDs are listed.
+- Output includes installed path, flavor, declared version, and install timestamp.
 
 ### Expected success/failure
 
 Success with exit code `0`.
 
-### Expected diagnostic summary
-
-Diagnostics list `croco-v2.1.2` and `msot-main` with installed paths, flavor, declared version when known, and install timestamp.
-
-## 18. Source inspect returns detailed metadata
+## 20. Source inspect returns detailed metadata
 
 ### Initial filesystem setup
 
 ```text
-.crocoexp/sources.json
-CROCO_EXPERIMENTS/sources/croco-v2.1.2/
-```
-
-### Command invoked
-
-```text
-crocoexp source inspect croco-v2.1.2
-```
-
-### Expected classification result
-
-- Source registry metadata is displayed.
-- The command remains read-only.
-
-### Expected generated paths
-
-No generated paths.
-
-### Expected success/failure
-
-Success with exit code `0`.
-
-### Expected diagnostic summary
-
-Diagnostics show source id, flavor, declared version, installed host path, origin path, git metadata when available, detected layout, and content identity when practical.
-
-## 19. Import with `--source` records `compile_time.source_ref`
-
-### Initial filesystem setup
-
-```text
-CROCO_EXPERIMENTS/import_with_source/input/croco.in
-CROCO_EXPERIMENTS/import_with_source/input/cppdefs.h
-CROCO_EXPERIMENTS/import_with_source/input/param.h
-CROCO_EXPERIMENTS/sources/croco-v2.1.2/
+CROCO_EXPERIMENTS/sources/croco-v2.1.3/
 .crocoexp/sources.json
 ```
 
 ### Command invoked
 
 ```text
-crocoexp import import_with_source --source croco-v2.1.2
+crocoexp source inspect croco-v2.1.3
 ```
 
-### Expected classification result
+### Expected result
 
-- `compile_time.source_ref.source_id` is `croco-v2.1.2`.
-- The source is recorded as compile input traceability.
-- The source tree is not copied into `input/`.
-
-### Expected generated paths
-
-```text
-CROCO_EXPERIMENTS/import_with_source/metadata/manifest.json
-CROCO_EXPERIMENTS/import_with_source/metadata/import_report.md
-```
+- Detailed metadata for `croco-v2.1.3` is printed.
+- No experiment directory is modified.
 
 ### Expected success/failure
 
 Success with exit code `0`.
 
-### Expected diagnostic summary
+## 21. Import with `--source` records `compile_time.source_ref`
 
-Diagnostics show the selected source id, flavor, declared version, and installed host path.
+### Initial filesystem setup
 
-## 20. Compile uses `source_ref` from manifest
+```text
+CROCO_EXPERIMENTS/import_source/input/croco.in
+CROCO_EXPERIMENTS/import_source/input/cppdefs.h
+CROCO_EXPERIMENTS/import_source/input/param.h
+CROCO_EXPERIMENTS/sources/croco-v2.1.3/
+.crocoexp/sources.json
+```
+
+### Command invoked
+
+```text
+crocoexp import import_source --source croco-v2.1.3
+```
+
+### Expected result
+
+- Manifest records `compile_time.source_ref.source_id = croco-v2.1.3`.
+- Source selection is per experiment.
+- No global version variable is written.
+
+### Expected success/failure
+
+Success with exit code `0`.
+
+## 22. Compile uses `source_ref` from manifest
 
 ### Initial filesystem setup
 
@@ -793,11 +697,11 @@ CROCO_EXPERIMENTS/compile_source_ref/input/croco.in
 CROCO_EXPERIMENTS/compile_source_ref/input/cppdefs.h
 CROCO_EXPERIMENTS/compile_source_ref/input/param.h
 CROCO_EXPERIMENTS/compile_source_ref/metadata/manifest.json
-CROCO_EXPERIMENTS/sources/croco-v2.1.2/
+CROCO_EXPERIMENTS/sources/croco-v2.1.3/
 .crocoexp/sources.json
 ```
 
-The manifest contains `compile_time.source_ref.source_id: croco-v2.1.2`.
+Manifest contains `compile_time.source_ref.source_id = croco-v2.1.3`.
 
 ### Command invoked
 
@@ -805,30 +709,17 @@ The manifest contains `compile_time.source_ref.source_id: croco-v2.1.2`.
 crocoexp compile compile_source_ref
 ```
 
-### Expected classification result
+### Expected result
 
-- Compile resolves the source from manifest `compile_time.source_ref`.
-- Compile reports the registered source as an input.
-- The registered source is read as compile infrastructure.
-
-### Expected generated paths
-
-```text
-CROCO_EXPERIMENTS/compile_source_ref/build/stage/
-CROCO_EXPERIMENTS/compile_source_ref/build/logs/
-CROCO_EXPERIMENTS/compile_source_ref/build/output/
-CROCO_EXPERIMENTS/compile_source_ref/metadata/compile_report.md
-```
+- Compile resolves the registered source from manifest.
+- Compile report records source id and installed source path.
+- No setup-level global source is consulted.
 
 ### Expected success/failure
 
-Success with exit code `0` when Docker and compilation succeed.
+Success with exit code `0` if compilation succeeds; otherwise compile failure with exit code `8`.
 
-### Expected diagnostic summary
-
-Diagnostics show the source id, installed path, Docker image, staged files, and build log path.
-
-## 21. Compile no longer depends on a global version variable
+## 23. Compile no longer depends on a global version variable
 
 ### Initial filesystem setup
 
@@ -837,12 +728,11 @@ CROCO_EXPERIMENTS/no_global_version/input/croco.in
 CROCO_EXPERIMENTS/no_global_version/input/cppdefs.h
 CROCO_EXPERIMENTS/no_global_version/input/param.h
 CROCO_EXPERIMENTS/no_global_version/metadata/manifest.json
-CROCO_EXPERIMENTS/sources/custom-fork/
+CROCO_EXPERIMENTS/sources/custom-source/
 .crocoexp/sources.json
-.crocoexp/config.json
 ```
 
-The setup config contains only Docker backend image state. The manifest contains `compile_time.source_ref.source_id: custom-fork`.
+Manifest selects `custom-source`.
 
 ### Command invoked
 
@@ -850,107 +740,69 @@ The setup config contains only Docker backend image state. The manifest contains
 crocoexp compile no_global_version
 ```
 
-### Expected classification result
+### Expected result
 
-- Compile uses `custom-fork` from the experiment manifest.
-- Compile does not read a setup-level CROCO version/source setting.
-
-### Expected generated paths
-
-```text
-CROCO_EXPERIMENTS/no_global_version/metadata/compile_report.md
-```
+- Compile uses `custom-source`.
+- No global CROCO version is required.
+- Diagnostics show selected source id.
 
 ### Expected success/failure
 
-Success with exit code `0` when Docker and compilation succeed.
+Success if compilation succeeds.
 
-### Expected diagnostic summary
-
-Diagnostics show the experiment-specific source id and Docker image separately.
-
-## 22. Source tree is copied under `CROCO_EXPERIMENTS/sources/<source_id>/`
+## 24. Source tree is copied under `CROCO_EXPERIMENTS/sources/<source_id>/`
 
 ### Initial filesystem setup
 
 ```text
-/tmp/source_origins/custom-fork/
-CROCO_EXPERIMENTS/
+/tmp/local-croco/
 ```
 
 ### Command invoked
 
 ```text
-crocoexp source install /tmp/source_origins/custom-fork --id custom-fork --flavor custom
+crocoexp source install /tmp/local-croco --id local-croco
 ```
 
-### Expected classification result
+### Expected result
 
-- The registered source is a copied managed source tree.
-- The normal workflow does not register an external symlink as the main source mechanism.
-
-### Expected generated paths
-
-```text
-CROCO_EXPERIMENTS/sources/custom-fork/
-.crocoexp/sources.json
-```
+- Source tree is copied, not symlinked from outside `CROCO_EXPERIMENTS`.
+- Installed path is visible under Docker mount.
+- Registry records origin path.
 
 ### Expected success/failure
 
 Success with exit code `0`.
 
-### Expected diagnostic summary
-
-Diagnostics show source copy destination under `CROCO_EXPERIMENTS/sources/custom-fork/`.
-
-## 23. Registered source is treated as read-only compile input
+## 25. Registered source is treated as read-only compile input
 
 ### Initial filesystem setup
 
 ```text
-CROCO_EXPERIMENTS/source_readonly/input/croco.in
-CROCO_EXPERIMENTS/source_readonly/input/cppdefs.h
-CROCO_EXPERIMENTS/source_readonly/input/param.h
-CROCO_EXPERIMENTS/source_readonly/metadata/manifest.json
-CROCO_EXPERIMENTS/sources/croco-v2.1.2/
-.crocoexp/sources.json
+CROCO_EXPERIMENTS/readonly_source/input/croco.in
+CROCO_EXPERIMENTS/readonly_source/input/cppdefs.h
+CROCO_EXPERIMENTS/readonly_source/input/param.h
+CROCO_EXPERIMENTS/readonly_source/metadata/manifest.json
+CROCO_EXPERIMENTS/sources/croco-v2.1.3/
 ```
 
 ### Command invoked
 
 ```text
-crocoexp compile source_readonly
+crocoexp compile readonly_source
 ```
 
-### Expected classification result
+### Expected result
 
-- Source files are read or copied into generated build staging as needed.
-- Build products and generated files are written under the experiment `build/`.
-- The registered source tree is not modified as part of normal compile.
-
-### Expected generated paths
-
-```text
-CROCO_EXPERIMENTS/source_readonly/build/stage/
-CROCO_EXPERIMENTS/source_readonly/build/output/
-```
-
-No generated file is expected under:
-
-```text
-CROCO_EXPERIMENTS/sources/croco-v2.1.2/
-```
+- Compile may stage files under `build/stage/`.
+- Registered source tree is not modified.
+- Compile report records source read-only assumption.
 
 ### Expected success/failure
 
-Success with exit code `0` when Docker and compilation succeed.
+Success if compilation succeeds.
 
-### Expected diagnostic summary
-
-Diagnostics distinguish registered source input from generated build outputs.
-
-## 24. Unknown source id in import fails clearly
+## 26. Unknown source id in import fails clearly
 
 ### Initial filesystem setup
 
@@ -969,19 +821,41 @@ CROCO_EXPERIMENTS/unknown_source/input/param.h
 crocoexp import unknown_source --source missing-source
 ```
 
-### Expected classification result
+### Expected result
 
-- No `compile_time.source_ref` is recorded as successfully resolved.
-- The failure is categorized as source registry or metadata/staging infrastructure, not semantic validation.
-
-### Expected generated paths
-
-No successful manifest is required. If a failure report is written, it must live under `metadata/` and not under `input/`.
+- Command fails clearly.
+- Diagnostic names the unknown source id.
+- No files under `input/` are modified.
 
 ### Expected success/failure
 
-Failure with exit code `4` or another implementation-defined registry resolution code documented in the CLI contract.
+Failure with exit code `4` or `3`, according to implementation convention for registry resolution failure.
 
-### Expected diagnostic summary
+## 27. Runtime execution plan: OpenMP
 
-Diagnostics name `missing-source`, identify `.crocoexp/sources.json`, and explain that the source id is not registered.
+- `input/cppdefs.h` defines `OPENMP`.
+- `input/param.h` defines `parameter (NPP=8)`.
+- Dry-run reports `parallel_backend: openmp`.
+- Dry-run reports planned `OMP_NUM_THREADS=8`.
+- Run passes `-e OMP_NUM_THREADS=8` to Docker.
+- `run_inside_docker.sh` contains `export OMP_NUM_THREADS=8`.
+- `run_inside_docker.sh` runs `./croco croco.in`.
+
+## 28. Runtime execution plan: unparsed NPP
+
+- `OPENMP` is active.
+- `NPP` cannot be parsed.
+- Dry-run warns and plans `OMP_NUM_THREADS=1`.
+- Run uses `OMP_NUM_THREADS=1`.
+
+## 29. Runtime execution plan: unsupported MPI
+
+- `cppdefs.h` defines `MPI`.
+- `run` fails before Docker execution with an unsupported runtime backend blocker.
+- No Docker run is attempted.
+
+## 30. Runtime execution plan: unsupported XIOS
+
+- `cppdefs.h` defines `XIOS`.
+- `run` fails before Docker execution with an unsupported runtime backend blocker.
+- No Docker run is attempted.
