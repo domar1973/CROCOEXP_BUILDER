@@ -1087,6 +1087,11 @@ def validate_experiment_name(experiment_name):
         raise CrocoexpError(f"invalid experiment name: {experiment_name}", 2, "invalid_usage")
 
 
+def validate_run_id(run_id):
+    if run_id in {".", ".."} or not re.fullmatch(r"[A-Za-z0-9_.-]+", run_id or ""):
+        raise CrocoexpError(f"invalid run id: {run_id}", 2, "invalid_usage")
+
+
 def source_ref_from_record(record, selection_source):
     return {
         "source_id": record["source_id"],
@@ -1792,6 +1797,10 @@ def generated_run_id():
     return f"dryrun_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
 
+def generated_execution_run_id():
+    return f"run-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+
+
 def binary_status(paths):
     output = paths["build"] / "output"
     candidates = []
@@ -2198,6 +2207,203 @@ def write_run_report(path, manifest, run_id, image, binary, dry_run_found, count
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def load_dry_run_plan(paths):
+    plan_path = paths["metadata"] / "dry_run_plan.json"
+    if not plan_path.is_file():
+        raise CrocoexpError(f"missing dry-run plan: {plan_path}; run 'crocoexp dry-run' first", 3, "missing_dry_run_plan")
+    try:
+        return json.loads(plan_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        raise CrocoexpError(f"malformed dry-run plan JSON: {plan_path}: {e}", 3, "malformed_dry_run_plan")
+    except OSError as e:
+        raise CrocoexpError(f"unable to read dry-run plan: {plan_path}: {e}", 3, "unreadable_dry_run_plan")
+
+
+def docker_image_for_run(plan):
+    compile_attempt = plan.get("compile_attempt", {})
+    if plan.get("docker_image"):
+        return plan["docker_image"]
+    if isinstance(compile_attempt, dict) and compile_attempt.get("docker_image"):
+        return compile_attempt["docker_image"]
+    return configured_default_image()
+
+
+def resolve_run_plan(paths, plan, run_id):
+    materialization = plan.get("runtime_materialization")
+    execution = plan.get("runtime_execution_plan")
+    if not isinstance(materialization, dict):
+        raise CrocoexpError("dry-run plan has no runtime materialization plan", 12, "missing_dry_run_materialization")
+    if not isinstance(execution, dict):
+        raise CrocoexpError("dry-run plan has no runtime execution plan", 10, "missing_dry_run_execution_plan")
+    if plan.get("status") not in {None, "planned"}:
+        if execution.get("status") != "planned":
+            raise CrocoexpError("dry-run runtime execution plan is blocked", 11, "unsupported_runtime_backend")
+        raise CrocoexpError(f"dry-run plan status does not allow execution: {plan.get('status')}", 10, "blocked_dry_run_plan")
+    if materialization.get("status") != "planned":
+        raise CrocoexpError("dry-run runtime materialization plan is not executable", 12, "blocked_dry_run_materialization")
+    if execution.get("status") != "planned":
+        raise CrocoexpError("dry-run runtime execution plan is blocked", 11, "unsupported_runtime_backend")
+    profile = execution.get("profile")
+    if profile not in {"serial", "openmp"}:
+        raise CrocoexpError(f"unsupported runtime execution profile for v1.0.0: {profile}", 11, "unsupported_runtime_backend")
+    binary_path = execution.get("binary_path") or plan.get("binary_path")
+    if not binary_path:
+        raise CrocoexpError("dry-run plan has no binary path", 10, "missing_compile_binary")
+    if not Path(binary_path).is_file():
+        raise CrocoexpError(f"recorded binary path is missing on disk: {binary_path}", 10, "missing_compile_binary")
+    if run_id != plan.get("run_id"):
+        materialization = dry_run_materialization_plan(paths, run_id, planned_runtime_assets_from_manifest(plan, paths))
+        execution = dict(execution)
+        execution["working_directory"] = str(paths["runs"] / run_id / "work")
+    return materialization, execution, Path(binary_path)
+
+
+def symlink_relative(src, dest):
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists() or dest.is_symlink():
+        dest.unlink()
+    target = os.path.relpath(src, start=dest.parent)
+    if os.path.isabs(target):
+        raise CrocoexpError(f"refusing to create absolute symlink target for {dest}", 12, "materialization_failed")
+    os.symlink(target, dest)
+    return target
+
+
+def materialize_run_workdir_from_plan(paths, run_dir, materialization, execution, binary_path):
+    workdir = run_dir / "work"
+    output_dir = run_dir / "output"
+    logs_dir = run_dir / "logs"
+    snapshots_dir = run_dir / "snapshots"
+    reports_dir = run_dir / "reports"
+    for directory in (workdir, output_dir, logs_dir, snapshots_dir, reports_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+    blockers = []
+    warnings = []
+    materialized = []
+    binary_link = workdir / "croco"
+    binary_target = symlink_relative(binary_path, binary_link)
+    materialized.append({"kind": "binary", "link_path": rel_to(binary_link, paths["experiment_root"]), "target_path": binary_target, "asset_path": str(binary_path)})
+
+    if "croco.in" in execution.get("argv", []):
+        croco_in = paths["input"] / "croco.in"
+        if not croco_in.is_file():
+            blockers.append({"category": "missing_artifact", "description": f"planned croco.in is missing: {croco_in}"})
+        else:
+            croco_link = workdir / "croco.in"
+            target = symlink_relative(croco_in, croco_link)
+            materialized.append({"kind": "croco_in", "link_path": rel_to(croco_link, paths["experiment_root"]), "target_path": target, "asset_path": "input/croco.in"})
+
+    for entry in materialization.get("symlinks", []):
+        target = entry.get("target_path")
+        if not target or os.path.isabs(target):
+            blockers.append({"category": "invalid_symlink_plan", "description": f"invalid symlink target for {entry.get('asset_path')}: {target}"})
+            continue
+        asset = paths["experiment_root"] / entry["asset_path"]
+        if not asset.is_file():
+            blockers.append({"category": "missing_runtime_asset", "description": f"planned runtime data asset is missing: {asset}"})
+            continue
+        link = paths["experiment_root"] / entry["link_path"]
+        link.parent.mkdir(parents=True, exist_ok=True)
+        if link.exists() or link.is_symlink():
+            link.unlink()
+        os.symlink(target, link)
+        materialized.append(dict(entry))
+    return {
+        "workdir": str(workdir),
+        "output_dir": str(output_dir),
+        "logs_dir": str(logs_dir),
+        "snapshots_dir": str(snapshots_dir),
+        "reports_dir": str(reports_dir),
+        "symlinks": materialized,
+        "warnings": warnings,
+        "blockers": blockers,
+    }
+
+
+def snapshot_run_inputs(paths, run_dir):
+    snapshots = run_dir / "snapshots"
+    snapshots.mkdir(parents=True, exist_ok=True)
+    records = []
+    for src in (paths["manifest"], paths["metadata"] / "dry_run_plan.json", paths["metadata"] / "compile_attempt.json"):
+        if src.is_file():
+            dest = snapshots / src.name
+            shutil.copy2(src, dest)
+            records.append({"source": str(src), "snapshot": str(dest), "kind": "metadata"})
+    for name in ("croco.in", "cppdefs.h", "param.h", "analytical.F"):
+        src = paths["input"] / name
+        if src.is_file():
+            dest = snapshots / name
+            shutil.copy2(src, dest)
+            records.append({"source": str(src), "snapshot": str(dest), "kind": "primary_input"})
+    runtime_inventory = []
+    for asset in sorted(paths["input"].rglob("*")):
+        if asset.is_file() and asset.suffix.lower() in DATA_SUFFIXES:
+            runtime_inventory.append({"path": rel_to(asset, paths["experiment_root"]), "size_bytes": asset.stat().st_size, "sha256": None})
+    inv = snapshots / "runtime_data_inventory.json"
+    inv.write_text(json.dumps(runtime_inventory, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    records.append({"source": "input_runtime_data_scan", "snapshot": str(inv), "kind": "runtime_data_inventory"})
+    return records
+
+
+def write_run_wrapper(run_dir, execution):
+    script = run_dir / "work" / "run_inside_docker.sh"
+    env_lines = [f"export {key}={value}" for key, value in sorted(execution.get("environment", {}).items())]
+    argv = execution.get("argv") or ["./croco", "croco.in"]
+    text = "#!/usr/bin/env bash\nset -euo pipefail\n" + "\n".join(env_lines) + "\n" + " ".join(argv) + "\n"
+    script.write_text(text, encoding="utf-8")
+    script.chmod(0o755)
+    return script
+
+
+def inventory_run_outputs(run_dir):
+    records = []
+    for base_name in ("work", "output"):
+        base = run_dir / base_name
+        if not base.exists():
+            continue
+        for path in sorted(p for p in base.rglob("*") if p.is_file() and not p.is_symlink()):
+            if path.name in {"run_inside_docker.sh"}:
+                continue
+            records.append({"path": rel_to(path, run_dir), "size_bytes": path.stat().st_size, "sha256": sha256_file(path)})
+    return records
+
+
+def write_run_attempt(path, attempt):
+    tmp = path.with_suffix(".json.tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(attempt, f, indent=2, sort_keys=True)
+        f.write("\n")
+    tmp.replace(path)
+
+
+def write_v1_run_report(path, attempt):
+    lines = [
+        "# Run Report",
+        "",
+        f"- Experiment: {attempt['experiment_name']}",
+        f"- Run ID: {attempt['run_id']}",
+        f"- Run status: {attempt['status']}",
+        f"- Selected profile: {attempt['profile']}",
+        f"- Docker image: {attempt['docker_image']}",
+        f"- Docker command attempted: {' '.join(attempt.get('docker_command', [])) if attempt.get('docker_command') else 'not attempted'}",
+        f"- Workdir: {attempt['workdir']}",
+        f"- Output directory: {attempt['output_dir']}",
+        f"- Stdout log: {attempt['logs']['stdout_path']}",
+        f"- Stderr log: {attempt['logs']['stderr_path']}",
+        f"- Materialized symlink count: {len(attempt['materialization']['symlinks'])}",
+        f"- Snapshot count: {len(attempt['materialization']['snapshots'])}",
+        f"- Return code: {attempt['returncode']}",
+        f"- Output inventory count: {len(attempt['outputs'])}",
+        "",
+        "## Blockers",
+    ]
+    lines.extend([f"- {b.get('category', 'blocker')}: {b.get('description', b)}" for b in attempt.get("blockers", [])] or ["- none"])
+    lines.extend(["", "## Warnings"])
+    lines.extend([f"- {w}" for w in attempt.get("warnings", [])] or ["- none"])
+    lines.extend(["", "## Scope Disclaimer", "", "Run records an execution attempt. Run success does not prove scientific correctness, runtime semantic compatibility, or experiment well-posedness."])
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def load_required_manifest_for_command(paths, experiment_name, command_name):
     if not paths["experiment_root"].is_dir():
         raise CrocoexpError(f"missing experiment directory: {paths['experiment_root']}", 6, "missing_experiment_input")
@@ -2517,81 +2723,39 @@ def cmd_dry_run(args):
 
 
 def cmd_run(args):
-    paths = experiment_paths(args)
     try:
-        if not paths["manifest"].exists():
-            raise CrocoexpError(
-                f"missing manifest: {paths['manifest']}; run 'crocoexp import {args.experiment_name}' first",
-                4,
-                "metadata_or_staging",
-            )
-        selected_binary, bin_status = select_binary(paths)
-        if selected_binary is None:
-            raise CrocoexpError("missing binary/build product under build/output; run 'crocoexp compile' first", 3, "missing_binary")
-        manifest, paths = refresh_manifest(args, "internal_refresh", record_command=False)
-        run_id = args.run_id or generated_run_id().replace("dryrun_", "run_")
+        paths = experiment_paths(args)
+        if args.run_id:
+            validate_run_id(args.run_id)
+        manifest = load_required_manifest_for_command(paths, args.experiment_name, "run")
+        dry_run_plan = load_dry_run_plan(paths)
+        run_id = args.run_id or generated_execution_run_id()
         run_dir = paths["runs"] / run_id
-        logs_dir = run_dir / "logs"
-        output_dir = run_dir / "output"
-        reports_dir = run_dir / "reports"
-        snapshots_dir = run_dir / "snapshots"
-        for directory in (logs_dir, output_dir, reports_dir, snapshots_dir):
-            directory.mkdir(parents=True, exist_ok=True)
-        if args.require_dry_run and not (reports_dir / "dry_run_report.md").exists():
-            raise CrocoexpError(f"missing required dry-run report: {reports_dir / 'dry_run_report.md'}", 4, "metadata_or_staging")
-
-        inventory, counts, materialization_plan, warnings, ambiguities, blockers = classify_dry_run_assets(paths, run_dir, selected_binary)
-        compile_context = runtime_compile_context(paths, manifest)
-        execution_plan = runtime_execution_plan(paths["input"], compile_context)
-        warnings.extend(execution_plan.get("warnings", []))
-        blockers.extend(execution_plan.get("blockers", []))
-        findings = ["Run is an execution attempt and does not prove CROCO semantic compatibility."]
-        if manifest.get("compile_time", {}).get("analytical_finding") == "present_in_input" and counts.get("runtime_data", 0):
-            manifest["reporting"].setdefault("possible_mismatches", []).append(
-                {
-                    "id": "finding.run.analytical_with_external_data",
-                    "description": "analytical.F is present while NetCDF-like runtime data assets exist under input/.",
-                    "impact": "reported only; not a default blocker",
-                }
-            )
-        failure_category = "none"
-        exit_code = 0
-        if any(b["category"] == "missing_artifact" for b in blockers):
-            failure_category = "missing_artifact"
-            exit_code = 3
-        elif any(b["category"] == "unsupported_runtime_backend" for b in blockers):
-            failure_category = "unsupported_runtime_backend"
-            exit_code = 4
-        elif blockers:
-            failure_category = "metadata_or_staging"
-            exit_code = 4
-
-        docker_image = args.image or configured_default_image()
-        if exit_code == 0:
-            materialization_plan = prepare_run_workdir(paths, run_dir, selected_binary)
-            if materialization_plan["blockers"]:
-                blockers = materialization_plan["blockers"]
-                failure_category = "metadata_or_staging"
-                exit_code = 4
-        snapshot_record = snapshot_dry_run(paths, manifest, run_dir, inventory, materialization_plan)
-        snapshot_record["kind"] = "run"
-        manifest.setdefault("snapshots", {}).setdefault("snapshot_records", []).append(snapshot_record)
-        manifest["snapshots"]["latest_run_snapshot"] = snapshot_record
-        log_path = logs_dir / "run.log"
-        report_path = reports_dir / "run_report.md"
-        metadata_report = paths["metadata"] / "report.md"
-        docker_mounts = [
-            {
-                "host_path": str(paths["experiments_root"]),
-                "container_path": CONTAINER_ROOT,
-                "mode": "rw",
-                "purpose": "whole_experiments_root_mount",
-            },
-        ]
+        materialization_plan, execution_plan, binary_path = resolve_run_plan(paths, dry_run_plan, run_id)
+        docker_image = docker_image_for_run(dry_run_plan)
+        materialized = materialize_run_workdir_from_plan(paths, run_dir, materialization_plan, execution_plan, binary_path)
+        snapshots = snapshot_run_inputs(paths, run_dir)
+        stdout_path = run_dir / "logs" / "run_stdout.log"
+        stderr_path = run_dir / "logs" / "run_stderr.log"
+        attempt_path = run_dir / "reports" / "run_attempt.json"
+        report_path = run_dir / "reports" / "run_report.md"
         run_script = None
         docker_cmd = []
-        if exit_code == 0:
-            run_script = write_run_script(paths, run_dir, execution_plan)
+        exit_code = 0
+        returncode = None
+        failure_category = "none"
+        blockers = list(materialized.get("blockers", []))
+        warnings = list(dry_run_plan.get("warnings", []))
+        warnings.extend(materialization_plan.get("warnings", []))
+        warnings.extend(execution_plan.get("warnings", []))
+        warnings.extend(materialized.get("warnings", []))
+        if blockers:
+            failure_category = "materialization_failed"
+            exit_code = 12
+            stdout_path.write_text("", encoding="utf-8")
+            stderr_path.write_text("Run was not attempted because runtime materialization failed.\n", encoding="utf-8")
+        else:
+            run_script = write_run_wrapper(run_dir, execution_plan)
             docker_cmd = [
                 "docker",
                 "run",
@@ -2601,116 +2765,112 @@ def cmd_run(args):
                 "-w",
                 container_path(run_dir / "work", paths["experiments_root"]),
             ]
-            omp_threads = execution_plan.get("openmp", {}).get("planned_omp_num_threads")
-            if omp_threads is not None:
-                docker_cmd.extend(["-e", f"OMP_NUM_THREADS={omp_threads}"])
-            docker_cmd.extend(
-                [
-                docker_image,
-                "bash",
-                container_path(run_script, paths["experiments_root"]),
-                ]
-            )
-        else:
-            findings.append("Run wrapper was not generated because runtime planning or workdir materialization was blocked.")
-        if exit_code == 0:
-            try:
-                with log_path.open("w", encoding="utf-8") as log:
-                    proc = subprocess.run(docker_cmd, stdout=log, stderr=subprocess.STDOUT, text=True)
-                if proc.returncode in {125, 126, 127}:
-                    failure_category = "docker_backend"
-                    exit_code = 7
-                elif proc.returncode != 0:
-                    failure_category = "run_failure"
-                    exit_code = 9
-            except FileNotFoundError:
-                log_path.write_text("ERROR: docker executable not found on host PATH.\n", encoding="utf-8")
+            for key, value in sorted(execution_plan.get("environment", {}).items()):
+                docker_cmd.extend(["-e", f"{key}={value}"])
+            docker_cmd.extend([docker_image, "bash", container_path(run_script, paths["experiments_root"])])
+            docker_path = shutil.which("docker")
+            if docker_path is None:
                 failure_category = "docker_backend"
                 exit_code = 7
-        else:
-            log_path.write_text("Run was not attempted because runtime planning or workdir materialization was blocked.\n", encoding="utf-8")
+                stdout_path.write_text("", encoding="utf-8")
+                stderr_path.write_text("ERROR: docker executable not found on host PATH.\n", encoding="utf-8")
+            else:
+                info_proc = run_docker_command(["docker", "info"])
+                if info_proc.returncode != 0:
+                    failure_category = "docker_backend"
+                    exit_code = 7
+                    stdout_path.write_text(info_proc.stdout or "", encoding="utf-8")
+                    stderr_path.write_text(info_proc.stderr or "ERROR: Docker daemon unavailable.\n", encoding="utf-8")
+                else:
+                    proc = subprocess.run(docker_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    returncode = proc.returncode
+                    stdout_path.write_text(proc.stdout or "", encoding="utf-8")
+                    stderr_path.write_text(proc.stderr or "", encoding="utf-8")
+                    if proc.returncode in {125, 126, 127}:
+                        failure_category = "docker_backend"
+                        exit_code = 7
+                    elif proc.returncode != 0:
+                        failure_category = "run_failure"
+                        exit_code = 13
 
-        collected_outputs = collect_run_outputs(run_dir, output_dir, materialization_plan)
-        materialization_plan["collected_outputs"] = collected_outputs
-        status = "reported_with_warnings" if warnings or ambiguities else "reported_clean"
-        if failure_category == "missing_artifact":
-            status = "blocked_missing_artifact"
-        elif failure_category == "missing_binary":
-            status = "blocked_missing_binary"
-        elif failure_category == "docker_backend":
-            status = "blocked_backend"
-        elif failure_category == "run_failure":
-            status = "blocked_run_failure"
-        manifest["assets"]["inventory"] = inventory
-        manifest["assets"]["classification_counts"] = counts
-        manifest["assets"]["selected_mounts"] = []
+        outputs = inventory_run_outputs(run_dir)
+        attempt = {
+            "schema_version": 1,
+            "experiment_name": args.experiment_name,
+            "run_id": run_id,
+            "attempted_at": utc_now(),
+            "status": "success" if exit_code == 0 else "failed",
+            "failure_category": failure_category,
+            "profile": execution_plan.get("profile"),
+            "docker_image": docker_image,
+            "docker_command": docker_cmd,
+            "workdir": str(run_dir / "work"),
+            "output_dir": str(run_dir / "output"),
+            "binary": {
+                "path": str(binary_path),
+                "workdir_link": rel_to(run_dir / "work" / "croco", paths["experiment_root"]),
+            },
+            "croco_in": {
+                "path": "input/croco.in",
+                "workdir_link": rel_to(run_dir / "work" / "croco.in", paths["experiment_root"]),
+            }
+            if "croco.in" in execution_plan.get("argv", [])
+            else None,
+            "source_plan": {
+                "dry_run_plan_path": str(paths["metadata"] / "dry_run_plan.json"),
+                "manifest_path": str(paths["manifest"]),
+            },
+            "materialization": {
+                "symlinks": materialized.get("symlinks", []),
+                "snapshots": snapshots,
+                "warnings": materialized.get("warnings", []),
+                "blockers": blockers,
+            },
+            "runtime_execution_plan": execution_plan,
+            "logs": {"stdout_path": str(stdout_path), "stderr_path": str(stderr_path)},
+            "returncode": returncode if returncode is not None else exit_code,
+            "outputs": outputs,
+            "warnings": warnings,
+            "blockers": blockers,
+        }
+        write_run_attempt(attempt_path, attempt)
+        write_v1_run_report(report_path, attempt)
         manifest["runtime_materialization"] = materialization_plan
         manifest["runtime_execution_plan"] = execution_plan
-        manifest["compile_time"]["active_cpp_symbols"] = compile_context["active_cpp_symbols"]
-        manifest["compile_time"]["active_cpp_symbols_source"] = compile_context["active_cpp_symbols_source"]
-        manifest["compile_time"]["active_symbol_resolution"] = compile_context["active_symbol_resolution"]
-        manifest["compile_time"]["input_cppdefs_hash"] = compile_context["input_cppdefs_hash"]
-        manifest["compile_time"]["input_param_hash"] = compile_context["input_param_hash"]
-        manifest["compile_time"]["effective_preprocessor_provenance"] = compile_context["effective_preprocessor_provenance"]
-        manifest["compile_time"]["effective_preprocessor_provenance_source"] = compile_context["effective_preprocessor_provenance_source"]
-        manifest["compile_time"]["dimensions"] = compile_context["dimensions"]
-        manifest["compile_time"]["effective_param_source"] = compile_context["effective_param_source"]
-        manifest["compile_time"]["effective_param_resolution"] = compile_context["effective_param_resolution"]
-        manifest["reporting"].update(
-            {
-                "status": status,
-                "last_reported_at": utc_now(),
-                "warnings": warnings,
-                "ambiguities": ambiguities,
-                "infrastructural_blockers": blockers,
-                "run_outcome": {
-                    "failure_category": failure_category,
-                    "exit_code": exit_code,
-                    "log": str(log_path),
-                    "collected_outputs": collected_outputs,
-                    "output_path": str(output_dir),
-                },
-            }
-        )
-        manifest["docker_backend"]["image"] = docker_image
-        manifest["docker_backend"]["mounts"] = docker_mounts
+        manifest.setdefault("docker_backend", {})["image"] = docker_image
         manifest["docker_backend"]["working_directory"] = container_path(run_dir / "work", paths["experiments_root"])
-        manifest["docker_backend"]["run_command_summary"] = " ".join(docker_cmd) if docker_cmd else "not attempted; runtime planning or workdir materialization blocked"
-        dry_run_found = (reports_dir / "dry_run_report.md").exists()
-        write_run_report(
-            report_path,
-            manifest,
-            run_id,
-            docker_image,
-            selected_binary,
-            dry_run_found,
-            counts,
-            inventory,
-            materialization_plan,
-            execution_plan,
-            collected_outputs,
-            warnings,
-            findings,
-            blockers,
-            " ".join(docker_cmd) if docker_cmd else "not attempted; runtime planning or workdir materialization blocked",
-            log_path,
-            output_dir,
-            snapshots_dir,
-            exit_code,
-            failure_category,
-        )
-        write_metadata_report(manifest, metadata_report)
+        manifest["docker_backend"]["run_command_summary"] = " ".join(docker_cmd) if docker_cmd else "not attempted; runtime materialization blocked"
+        manifest.setdefault("runs", {})["last_run_id"] = run_id
+        manifest["runs"]["last_attempt"] = {
+            "run_id": run_id,
+            "attempted_at": attempt["attempted_at"],
+            "status": attempt["status"],
+            "profile": execution_plan.get("profile"),
+            "report_path": str(report_path),
+            "attempt_path": str(attempt_path),
+            "returncode": attempt["returncode"],
+            "failure_category": failure_category,
+        }
+        manifest.setdefault("reporting", {})["run_outcome"] = {
+            "failure_category": failure_category,
+            "exit_code": exit_code,
+            "stdout_log": str(stdout_path),
+            "stderr_log": str(stderr_path),
+            "output_path": str(run_dir / "output"),
+            "attempt": str(attempt_path),
+            "outputs": outputs,
+        }
         append_command(
             manifest,
             "run",
             [args.experiment_name],
-            inputs_used=[f"input/{name}" for name in PRIMARY_ARTIFACTS] + [str(selected_binary)],
+            inputs_used=[str(paths["metadata"] / "dry_run_plan.json"), str(binary_path)],
             staging_decisions=[{"source": str(run_script), "destination": str(run_script), "reason": "generated_run_wrapper"}] if run_script else [],
-            mappings=docker_mounts + materialization_plan.get("symlinked_runtime_data", []),
-            logs=[str(log_path)],
-            reports=[str(report_path), str(metadata_report)],
+            mappings=[{"host_path": str(paths["experiments_root"]), "container_path": CONTAINER_ROOT, "mode": "rw"}] + materialized.get("symlinks", []),
+            logs=[str(stdout_path), str(stderr_path)],
+            reports=[str(report_path), str(attempt_path)],
             warnings=warnings,
-            findings=findings,
+            findings=["Run records an execution attempt and does not prove scientific correctness."],
             failure_category=failure_category,
             exit_code=exit_code,
             docker_image=docker_image,
@@ -2722,11 +2882,14 @@ def cmd_run(args):
             {
                 "run_id": run_id,
                 "run_report": str(report_path),
-                "run_log": str(log_path),
-                "output_path": str(output_dir),
-                "snapshot": str(snapshots_dir),
-                "binary": str(selected_binary),
+                "run_attempt": str(attempt_path),
+                "run_stdout": str(stdout_path),
+                "run_stderr": str(stderr_path),
+                "output_path": str(run_dir / "output"),
+                "snapshot": str(run_dir / "snapshots"),
+                "binary": str(binary_path),
                 "failure_category": failure_category,
+                "status": attempt["status"],
             }
         )
         print_or_json(summary, args.json)

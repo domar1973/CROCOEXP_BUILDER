@@ -184,6 +184,11 @@ exit 1
         (exp / "metadata" / "compile_attempt.json").write_text(json.dumps(attempt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         return attempt
 
+    def prepare_dry_run_plan(self, root, name="EXP_A", run_id="DRYRUN", status="success", binary=True, env=None):
+        attempt = self.seed_compile_attempt(root, name=name, status=status, binary=binary)
+        result = self.run_cli(["--experiments-root", str(root), "dry-run", name, "--run-id", run_id], env=env)
+        return result, attempt
+
     def write_cppdefs_param(self, root, name="EXP_A", cppdefs="", param=""):
         input_dir = root / name / "input"
         (input_dir / "cppdefs.h").write_text(cppdefs or "#define TEST\n", encoding="utf-8")
@@ -1274,16 +1279,92 @@ exit 1
             plan = json.loads((root / "EXP_A" / "metadata" / "dry_run_plan.json").read_text(encoding="utf-8"))
             self.assertEqual(plan["runtime_execution_plan"]["profile"], "unsupported")
 
-    def test_run_fails_clearly_when_binary_missing(self):
+    def test_run_requires_imported_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "CROCO_EXPERIMENTS"
+            self.make_exp(root, data=True)
+            result = self.run_cli(["--experiments-root", str(root), "run", "EXP_A"])
+            self.assertEqual(result.returncode, 3)
+            self.assertIn("manifest", result.stderr)
+
+    def test_run_fails_when_root_or_input_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "CROCO_EXPERIMENTS"
+            result = self.run_cli(["--experiments-root", str(root), "run", "MISSING"])
+            self.assertEqual(result.returncode, 6)
+            self.assertIn("experiment", result.stderr)
+            exp = root / "EXP_A"
+            (exp / "metadata").mkdir(parents=True)
+            (exp / "metadata" / "manifest.json").write_text("{}", encoding="utf-8")
+            result = self.run_cli(["--experiments-root", str(root), "run", "EXP_A"])
+            self.assertEqual(result.returncode, 6)
+            self.assertIn("input", result.stderr)
+
+    def test_run_fails_when_manifest_is_malformed(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "CROCO_EXPERIMENTS"
             self.make_exp(root, data=True)
             self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A"]).returncode, 0)
-            result = self.run_cli(["--experiments-root", str(root), "run", "EXP_A", "--run-id", "RUN1", "--image", "fake/image"])
+            (root / "EXP_A" / "metadata" / "manifest.json").write_text("{bad json", encoding="utf-8")
+            result = self.run_cli(["--experiments-root", str(root), "run", "EXP_A"])
             self.assertEqual(result.returncode, 3)
-            self.assertIn("compile", result.stderr)
+            self.assertIn("malformed", result.stderr)
 
-    def test_run_without_prior_dry_run_creates_outputs_reports_snapshots(self):
+    def test_run_requires_dry_run_plan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "CROCO_EXPERIMENTS"
+            self.make_exp(root, data=True)
+            self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A"]).returncode, 0)
+            self.seed_compile_attempt(root)
+            result = self.run_cli(["--experiments-root", str(root), "run", "EXP_A", "--run-id", "RUN1"])
+            self.assertEqual(result.returncode, 3)
+            self.assertIn("dry-run", result.stderr)
+
+    def test_run_fails_when_dry_run_plan_is_malformed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "CROCO_EXPERIMENTS"
+            self.make_exp(root, data=True)
+            self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A"]).returncode, 0)
+            (root / "EXP_A" / "metadata" / "dry_run_plan.json").write_text("{bad json", encoding="utf-8")
+            result = self.run_cli(["--experiments-root", str(root), "run", "EXP_A", "--run-id", "RUN1"])
+            self.assertEqual(result.returncode, 3)
+            self.assertIn("malformed dry-run", result.stderr)
+
+    def test_run_fails_when_binary_metadata_or_path_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "CROCO_EXPERIMENTS"
+            self.make_exp(root, data=True)
+            self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A"]).returncode, 0)
+            dry, _ = self.prepare_dry_run_plan(root, run_id="RUNBIN")
+            self.assertEqual(dry.returncode, 0, dry.stderr)
+            plan_path = root / "EXP_A" / "metadata" / "dry_run_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            Path(plan["binary_path"]).unlink()
+            result = self.run_cli(["--experiments-root", str(root), "run", "EXP_A", "--run-id", "RUNBIN"])
+            self.assertEqual(result.returncode, 10)
+            self.assertIn("binary", result.stderr)
+            binary = self.add_binary(root)
+            plan["binary_path"] = ""
+            plan["runtime_execution_plan"].pop("binary_path", None)
+            plan_path.write_text(json.dumps(plan, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            binary.unlink()
+            result = self.run_cli(["--experiments-root", str(root), "run", "EXP_A", "--run-id", "RUNBIN2"])
+            self.assertEqual(result.returncode, 10)
+            self.assertIn("binary", result.stderr)
+
+    def test_run_rejects_invalid_experiment_names_and_run_ids(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "CROCO_EXPERIMENTS"
+            for name in (".", "..", "bad/name", r"bad\name"):
+                result = self.run_cli(["--experiments-root", str(root), "run", name])
+                self.assertEqual(result.returncode, 2, name)
+            self.make_exp(root, data=True)
+            self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A"]).returncode, 0)
+            for run_id in (".", "..", "bad/id", r"bad\id"):
+                result = self.run_cli(["--experiments-root", str(root), "run", "EXP_A", "--run-id", run_id])
+                self.assertEqual(result.returncode, 2, run_id)
+
+    def test_run_materializes_workdir_records_attempt_and_preserves_input(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "CROCO_EXPERIMENTS"
             self.make_exp(root, analytical=True, data=True)
@@ -1292,288 +1373,67 @@ exit 1
             env["FAKE_DOCKER_RUN_CODE"] = "0"
             env["FAKE_DOCKER_WORK_OUTPUT"] = "HIS/history.nc"
             self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A"], env=env).returncode, 0)
-            binary = self.add_binary(root)
-            result = self.run_cli(["--experiments-root", str(root), "run", "EXP_A", "--run-id", "RUN2", "--image", "fake/image"], env=env)
+            dry, attempt = self.prepare_dry_run_plan(root, run_id="RUN2", env=env)
+            self.assertEqual(dry.returncode, 0, dry.stderr)
+            input_before = {p.relative_to(root / "EXP_A" / "input"): p.read_bytes() for p in (root / "EXP_A" / "input").rglob("*") if p.is_file()}
+            result = self.run_cli(["--experiments-root", str(root), "run", "EXP_A", "--run-id", "RUN2", "--json"], env=env)
             self.assertEqual(result.returncode, 0, result.stderr)
+            summary = json.loads(result.stdout)
+            self.assertEqual(summary["run_id"], "RUN2")
             run_dir = root / "EXP_A" / "runs" / "RUN2"
-            self.assertTrue((run_dir / "logs").is_dir())
-            self.assertTrue((run_dir / "output").is_dir())
-            self.assertTrue((run_dir / "snapshots").is_dir())
-            self.assertTrue((run_dir / "reports" / "run_report.md").exists())
-            self.assertTrue((run_dir / "logs" / "run.log").exists())
-            self.assertFalse((run_dir / "snapshots" / "forcing.nc").exists())
-            self.assertTrue((run_dir / "work" / "croco.in").is_file())
-            self.assertTrue((run_dir / "work" / "croco").is_file())
-            self.assertTrue(os.access(run_dir / "work" / "croco", os.X_OK))
-            self.assertTrue((run_dir / "work" / "run_inside_docker.sh").is_file())
+            for dirname in ("work", "output", "logs", "snapshots", "reports"):
+                self.assertTrue((run_dir / dirname).is_dir())
+            self.assertTrue((run_dir / "reports" / "run_attempt.json").is_file())
+            self.assertTrue((run_dir / "reports" / "run_report.md").is_file())
+            self.assertTrue((run_dir / "logs" / "run_stdout.log").is_file())
+            self.assertTrue((run_dir / "logs" / "run_stderr.log").is_file())
+            self.assertTrue((run_dir / "work" / "croco").is_symlink())
+            self.assertTrue((run_dir / "work" / "croco.in").is_symlink())
             self.assertTrue((run_dir / "work" / "forcing.nc").is_symlink())
             self.assertTrue((run_dir / "work" / "GRD" / "grid.nc").is_symlink())
-            self.assertTrue((run_dir / "work" / "INIT" / "init.nc").is_symlink())
             self.assertFalse(os.readlink(run_dir / "work" / "GRD" / "grid.nc").startswith("/"))
             self.assertEqual((run_dir / "work" / "GRD" / "grid.nc").resolve(), root / "EXP_A" / "input" / "GRD" / "grid.nc")
-            self.assertEqual((run_dir / "work" / "INIT" / "init.nc").resolve(), root / "EXP_A" / "input" / "INIT" / "init.nc")
-            script = (run_dir / "work" / "run_inside_docker.sh").read_text(encoding="utf-8")
-            self.assertIn("./croco croco.in", script)
-            self.assertTrue((run_dir / "output" / "HIS" / "history.nc").is_file())
+            self.assertFalse((run_dir / "snapshots" / "forcing.nc").exists())
+            self.assertTrue((run_dir / "snapshots" / "manifest.json").is_file())
+            self.assertTrue((run_dir / "snapshots" / "dry_run_plan.json").is_file())
+            self.assertTrue((run_dir / "snapshots" / "compile_attempt.json").is_file())
+            self.assertTrue((run_dir / "snapshots" / "cppdefs.h").is_file())
             self.assertTrue((run_dir / "work" / "HIS" / "history.nc").is_file())
-            self.assertEqual((root / "EXP_A" / "input" / "forcing.nc").read_bytes(), b"not a real netcdf")
+            input_after = {p.relative_to(root / "EXP_A" / "input"): p.read_bytes() for p in (root / "EXP_A" / "input").rglob("*") if p.is_file()}
+            self.assertEqual(input_before, input_after)
             manifest = json.loads((root / "EXP_A" / "metadata" / "manifest.json").read_text(encoding="utf-8"))
-            self.assertEqual(manifest["commands"][-1]["command"], "run")
+            self.assertEqual(manifest["runs"]["last_run_id"], "RUN2")
+            self.assertEqual(manifest["runs"]["last_attempt"]["status"], "success")
             self.assertEqual(manifest["reporting"]["run_outcome"]["failure_category"], "none")
-            self.assertEqual(manifest["snapshots"]["latest_run_snapshot"]["kind"], "run")
-            self.assertEqual(manifest["runtime_materialization"]["workdir_host_path"], str(run_dir / "work"))
-            command_parts = manifest["docker_backend"]["run_command_summary"].split()
-            volume_specs = [command_parts[i + 1] for i, part in enumerate(command_parts[:-1]) if part == "-v"]
-            self.assertTrue(volume_specs)
-            for spec in volume_specs:
-                self.assertIn(":", spec)
-                self.assertTrue(spec.split(":", 1)[0].startswith("/"))
-                self.assertTrue(spec.startswith(str(root)))
-            self.assertIn("-w", command_parts)
-            self.assertEqual(command_parts[command_parts.index("-w") + 1], "/opt/CROCO_EXPERIMENTS/EXP_A/runs/RUN2/work")
-            self.assertEqual(
-                manifest["reporting"]["run_outcome"]["collected_outputs"][0]["destination_host_path"],
-                str(run_dir / "output" / "HIS" / "history.nc"),
-            )
-            self.assertEqual(manifest["reporting"]["run_outcome"]["collected_outputs"][0]["action"], "copied_from_workdir")
-            self.assertEqual(Path(manifest["commands"][-1]["inputs_used"][-1]), binary)
+            self.assertEqual(manifest["commands"][-1]["command"], "run")
+            attempt_json = json.loads((run_dir / "reports" / "run_attempt.json").read_text(encoding="utf-8"))
+            self.assertEqual(attempt_json["docker_image"], attempt["docker_image"])
+            self.assertEqual(attempt_json["profile"], "serial")
+            self.assertTrue(attempt_json["outputs"])
+            self.assertIn("docker", attempt_json["docker_command"][0])
+            report = (run_dir / "reports" / "run_report.md").read_text(encoding="utf-8")
+            self.assertIn("Run success does not prove scientific correctness", report)
 
-    def test_openmp_runtime_plan_forces_npp_threads(self):
+    def test_run_openmp_profile_sets_environment_from_dry_run_plan(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "CROCO_EXPERIMENTS"
             self.make_exp(root, data=True)
-            self.write_cppdefs_param(
-                root,
-                cppdefs="#define OPENMP\n",
-                param="parameter (NPP=8)\nparameter (NSUB_X=2, NSUB_E=4)\n",
-            )
+            self.write_cppdefs_param(root, cppdefs="#define OPENMP\n", param="parameter (NPP=8)\n")
             env = self.fake_docker_env(tmp, present=True)
             env["FAKE_DOCKER_RUN_CODE"] = "0"
             self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A"], env=env).returncode, 0)
-            self.add_binary(root)
-            result = self.run_cli(["--experiments-root", str(root), "run", "EXP_A", "--run-id", "OMP8", "--image", "fake/image"], env=env)
+            dry, _ = self.prepare_dry_run_plan(root, run_id="OMP8", env=env)
+            self.assertEqual(dry.returncode, 0, dry.stderr)
+            result = self.run_cli(["--experiments-root", str(root), "run", "EXP_A", "--run-id", "OMP8"], env=env)
             self.assertEqual(result.returncode, 0, result.stderr)
-            manifest = json.loads((root / "EXP_A" / "metadata" / "manifest.json").read_text(encoding="utf-8"))
-            plan = manifest["runtime_execution_plan"]
-            self.assertEqual(plan["parallel_backend"], "openmp")
-            self.assertEqual(plan["openmp"]["planned_omp_num_threads"], 8)
-            self.assertIn("-e OMP_NUM_THREADS=8", manifest["docker_backend"]["run_command_summary"])
-            script = root / "EXP_A" / "runs" / "OMP8" / "work" / "run_inside_docker.sh"
-            self.assertIn("export OMP_NUM_THREADS=8", script.read_text(encoding="utf-8"))
+            run_dir = root / "EXP_A" / "runs" / "OMP8"
+            attempt = json.loads((run_dir / "reports" / "run_attempt.json").read_text(encoding="utf-8"))
+            self.assertEqual(attempt["profile"], "openmp")
+            self.assertIn("-e", attempt["docker_command"])
+            self.assertIn("OMP_NUM_THREADS=8", attempt["docker_command"])
+            self.assertIn("export OMP_NUM_THREADS=8", (run_dir / "work" / "run_inside_docker.sh").read_text(encoding="utf-8"))
 
-    def test_exact_backend_symbols_ignore_mpi_compatibility_macros(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "CROCO_EXPERIMENTS"
-            self.make_exp(root, data=True)
-            self.write_cppdefs_param(
-                root,
-                cppdefs="# define OPENMP\n# undef MPI\n#define MPI_COMM_WORLD 0\n#define MPI_master_only\n",
-                param="parameter (NPP=8)\n",
-            )
-            env = self.fake_docker_env(tmp, present=True)
-            env["FAKE_DOCKER_RUN_CODE"] = "0"
-            self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A"], env=env).returncode, 0)
-            self.add_binary(root)
-            result = self.run_cli(["--experiments-root", str(root), "run", "EXP_A", "--run-id", "COMPAT", "--image", "fake/image"], env=env)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            manifest = json.loads((root / "EXP_A" / "metadata" / "manifest.json").read_text(encoding="utf-8"))
-            plan = manifest["runtime_execution_plan"]
-            self.assertEqual(plan["parallel_backend"], "openmp")
-            self.assertTrue(plan["backend_symbols"]["OPENMP"])
-            self.assertFalse(plan["backend_symbols"]["MPI"])
-            self.assertIn("MPI_COMM_WORLD", manifest["compile_time"]["parsed_symbols"])
-            self.assertIn("MPI_MASTER_ONLY", manifest["compile_time"]["parsed_symbols"])
-
-    def test_distribution_style_branches_resolve_effective_openmp(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "CROCO_EXPERIMENTS"
-            self.make_exp(root, data=True)
-            self.write_cppdefs_param(
-                root,
-                cppdefs=(
-                    "#define MESA_ROTANTE\n"
-                    "#ifdef MESA_ROTANTE\n"
-                    "# define OPENMP\n"
-                    "# undef  MPI\n"
-                    "#endif\n"
-                    "#ifdef BASIN\n"
-                    "# undef  OPENMP\n"
-                    "# define MPI\n"
-                    "#endif\n"
-                    "#ifdef BENGUELA\n"
-                    "# define MPI\n"
-                    "# undef OPENMP\n"
-                    "#endif\n"
-                    "#define MPI_COMM_WORLD 0\n"
-                    "#define MPI_master_only\n"
-                ),
-                param=(
-                    "#ifdef MPI\n"
-                    "      parameter (NPP=1)\n"
-                    "      parameter (NNODES=4)\n"
-                    "#elif defined OPENMP\n"
-                    "      parameter (NPP=8)\n"
-                    "      parameter (NSUB_X=2, NSUB_E=4)\n"
-                    "#else\n"
-                    "      parameter (NPP=1)\n"
-                    "#endif\n"
-                ),
-            )
-            env = self.fake_docker_env(tmp, present=True)
-            env["FAKE_DOCKER_RUN_CODE"] = "0"
-            self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A"], env=env).returncode, 0)
-            self.add_binary(root)
-            result = self.run_cli(["--experiments-root", str(root), "run", "EXP_A", "--run-id", "MESA", "--image", "fake/image"], env=env)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            manifest = json.loads((root / "EXP_A" / "metadata" / "manifest.json").read_text(encoding="utf-8"))
-            plan = manifest["runtime_execution_plan"]
-            self.assertEqual(plan["parallel_backend"], "openmp")
-            self.assertTrue(plan["backend_symbols"]["OPENMP"])
-            self.assertFalse(plan["backend_symbols"]["MPI"])
-            self.assertEqual(plan["openmp"]["npp"], 8)
-            self.assertEqual(plan["openmp"]["nsub_x"], 2)
-            self.assertEqual(plan["openmp"]["nsub_e"], 4)
-            self.assertEqual(plan["openmp"]["planned_omp_num_threads"], 8)
-            self.assertIn("-e OMP_NUM_THREADS=8", manifest["docker_backend"]["run_command_summary"])
-            script = root / "EXP_A" / "runs" / "MESA" / "work" / "run_inside_docker.sh"
-            script_text = script.read_text(encoding="utf-8")
-            self.assertIn("export OMP_NUM_THREADS=8", script_text)
-            self.assertIn('echo "CROCOEXP: OMP_NUM_THREADS=${OMP_NUM_THREADS}"', script_text)
-
-    def test_stale_compile_symbols_are_recomputed_from_current_input(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "CROCO_EXPERIMENTS"
-            self.make_exp(root, data=True)
-            self.write_cppdefs_param(root, cppdefs="#define TEST\n", param="parameter (NPP=1)\n")
-            env = self.fake_docker_env(tmp, present=True)
-            env["FAKE_DOCKER_RUN_CODE"] = "0"
-            self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A"], env=env).returncode, 0)
-            manifest_path = root / "EXP_A" / "metadata" / "manifest.json"
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            manifest["reporting"]["compile_outcome"] = {"failure_category": "none", "exit_code": 0}
-            manifest["compile_time"]["active_cpp_symbols"] = ["TEST"]
-            manifest["compile_time"]["dimensions"] = {"npp": 1, "nsub_x": 1, "nsub_e": 1, "np_xi": None, "np_eta": None, "nnodes": None}
-            manifest["compile_time"]["input_cppdefs_hash"] = "stale"
-            manifest["compile_time"]["input_param_hash"] = "stale"
-            manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-            self.write_cppdefs_param(
-                root,
-                cppdefs="#define MESA_ROTANTE\n#if defined MESA_ROTANTE\n# define OPENMP\n# undef MPI\n#endif\n",
-                param="#ifdef OPENMP\nparameter (NPP=8)\nparameter (NSUB_X=2, NSUB_E=4)\n#else\nparameter (NPP=1)\n#endif\n",
-            )
-            self.add_binary(root)
-            result = self.run_cli(["--experiments-root", str(root), "run", "EXP_A", "--run-id", "STALE", "--image", "fake/image"], env=env)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            plan = manifest["runtime_execution_plan"]
-            self.assertEqual(plan["parallel_backend"], "openmp")
-            self.assertTrue(plan["active_symbol_resolution"]["contains_OPENMP"])
-            self.assertEqual(plan["active_symbol_resolution"]["source"], "freshly_preprocessed")
-            self.assertEqual(plan["effective_param_resolution"]["parsed_NPP"], 8)
-            self.assertEqual(plan["openmp"]["planned_omp_num_threads"], 8)
-
-    def test_wrong_compile_evidence_without_provenance_is_rejected(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "CROCO_EXPERIMENTS"
-            self.make_exp(root, data=True)
-            self.write_cppdefs_param(
-                root,
-                cppdefs="#define MESA_ROTANTE\n#if defined MESA_ROTANTE\n# define OPENMP\n# undef MPI\n#endif\n#define ANA_GRID\n#define ANA_INITIAL\n",
-                param="#ifdef MPI\nparameter (NPP=1)\nparameter (NSUB_X=1, NSUB_E=1)\n#elif defined OPENMP\nparameter (NPP=8)\nparameter (NSUB_X=2, NSUB_E=4)\n#else\nparameter (NPP=1)\n#endif\n",
-            )
-            env = self.fake_docker_env(tmp, present=True)
-            env["FAKE_DOCKER_RUN_CODE"] = "0"
-            self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A"], env=env).returncode, 0)
-            manifest_path = root / "EXP_A" / "metadata" / "manifest.json"
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            logs = root / "EXP_A" / "build" / "logs"
-            logs.mkdir(parents=True, exist_ok=True)
-            wrong_symbols = logs / "active_cpp_symbols.txt"
-            wrong_symbols.write_text("#define ANA_GRID 1\n#define ANA_INITIAL 1\n", encoding="utf-8")
-            wrong_param = logs / "effective_param.h"
-            wrong_param.write_text("parameter (NPP=1)\nparameter (NSUB_X=1, NSUB_E=1)\n", encoding="utf-8")
-            manifest["reporting"]["compile_outcome"] = {"failure_category": "none", "exit_code": 0}
-            manifest["compile_time"]["active_cpp_symbols"] = ["ANA_GRID", "ANA_INITIAL"]
-            manifest["compile_time"]["active_cpp_symbols_source"] = str(wrong_symbols)
-            manifest["compile_time"]["effective_param_source"] = str(wrong_param)
-            manifest["compile_time"]["dimensions"] = {"npp": 1, "nsub_x": 1, "nsub_e": 1, "np_xi": None, "np_eta": None, "nnodes": None}
-            manifest["compile_time"]["input_cppdefs_hash"] = manifest["runtime_execution_plan"]["active_symbol_resolution"]["input_cppdefs_hash"]
-            manifest["compile_time"]["input_param_hash"] = manifest["runtime_execution_plan"]["effective_param_resolution"]["input_param_hash"]
-            manifest["compile_time"].pop("effective_preprocessor_provenance", None)
-            manifest["compile_time"].pop("effective_preprocessor_provenance_source", None)
-            manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-            self.add_binary(root)
-            result = self.run_cli(["--experiments-root", str(root), "run", "EXP_A", "--run-id", "WRONGEVID", "--image", "fake/image"], env=env)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            plan = manifest["runtime_execution_plan"]
-            self.assertEqual(plan["parallel_backend"], "openmp")
-            self.assertEqual(plan["openmp"]["planned_omp_num_threads"], 8)
-            self.assertFalse(plan["active_symbol_resolution"]["compile_time_active_symbols_trusted"])
-            self.assertIn(
-                plan["active_symbol_resolution"]["trust_rejection_reason"],
-                {"missing effective preprocessor provenance", "active_cpp_symbols artifact is missing"},
-            )
-            self.assertTrue(plan["active_symbol_resolution"]["fresh_preprocessing_attempted"])
-
-    def test_experiment_cppdefs_precedes_source_tree_default(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "CROCO_EXPERIMENTS"
-            env = self.fake_docker_env(tmp, present=True)
-            env["FAKE_DOCKER_RUN_CODE"] = "0"
-            self.make_exp(root, data=True)
-            self.write_cppdefs_param(
-                root,
-                cppdefs="#define MESA_ROTANTE\n#if defined MESA_ROTANTE\n# define OPENMP\n#endif\n",
-                param="#ifdef OPENMP\nparameter (NPP=8)\nparameter (NSUB_X=2, NSUB_E=4)\n#else\nparameter (NPP=1)\n#endif\n",
-            )
-            source = self.make_source(tmp, "source-default")
-            (source / "OCEAN" / "cppdefs.h").write_text("#define OTHER_CASE\n#undef OPENMP\n", encoding="utf-8")
-            install = self.run_cli(["--experiments-root", str(root), "source", "install", str(source), "--id", "default-source"], env=env)
-            self.assertEqual(install.returncode, 0, install.stderr)
-            self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A", "--source", "default-source"], env=env).returncode, 0)
-            self.add_binary(root)
-            result = self.run_cli(["--experiments-root", str(root), "run", "EXP_A", "--run-id", "PRECEDENCE", "--image", "fake/image"], env=env)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            manifest = json.loads((root / "EXP_A" / "metadata" / "manifest.json").read_text(encoding="utf-8"))
-            plan = manifest["runtime_execution_plan"]
-            self.assertEqual(plan["parallel_backend"], "openmp")
-            self.assertTrue(plan["backend_symbols"]["OPENMP"])
-            self.assertIn(str(root / "EXP_A" / "input"), plan["active_symbol_resolution"]["include_paths"][0])
-            self.assertIn(str(root / "EXP_A" / "input" / "cppdefs.h"), plan["active_symbol_resolution"]["probe_content"])
-
-    def test_mpi_compatibility_macro_alone_does_not_block(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "CROCO_EXPERIMENTS"
-            self.make_exp(root, data=True)
-            self.write_cppdefs_param(root, cppdefs="#define MPI_COMM_WORLD 0\n", param="#define LLm 10\n")
-            env = self.fake_docker_env(tmp, present=True)
-            env["FAKE_DOCKER_RUN_CODE"] = "0"
-            self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A"], env=env).returncode, 0)
-            self.add_binary(root)
-            result = self.run_cli(["--experiments-root", str(root), "run", "EXP_A", "--run-id", "MPIDUMMY", "--image", "fake/image"], env=env)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            manifest = json.loads((root / "EXP_A" / "metadata" / "manifest.json").read_text(encoding="utf-8"))
-            self.assertEqual(manifest["runtime_execution_plan"]["parallel_backend"], "serial")
-            self.assertFalse(manifest["runtime_execution_plan"]["backend_symbols"]["MPI"])
-
-    def test_openmp_unparsed_npp_defaults_to_one_with_warning(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "CROCO_EXPERIMENTS"
-            self.make_exp(root, data=True)
-            self.write_cppdefs_param(root, cppdefs="#define OPENMP\n", param="parameter (NPP=NP_THREADS)\n")
-            env = self.fake_docker_env(tmp, present=True)
-            env["FAKE_DOCKER_RUN_CODE"] = "0"
-            self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A"], env=env).returncode, 0)
-            self.add_binary(root)
-            result = self.run_cli(["--experiments-root", str(root), "run", "EXP_A", "--run-id", "OMP1", "--image", "fake/image"], env=env)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            manifest = json.loads((root / "EXP_A" / "metadata" / "manifest.json").read_text(encoding="utf-8"))
-            self.assertEqual(manifest["runtime_execution_plan"]["openmp"]["planned_omp_num_threads"], 1)
-            self.assertIn("OMP_NUM_THREADS=1", manifest["docker_backend"]["run_command_summary"])
-            self.assertTrue(any("NPP could not be parsed" in warning for warning in manifest["reporting"]["warnings"]))
-
-    def test_mpi_runtime_plan_blocks_before_docker(self):
+    def test_run_blocks_unsupported_profile_before_docker(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "CROCO_EXPERIMENTS"
             self.make_exp(root, data=True)
@@ -1581,140 +1441,85 @@ exit 1
             env = self.fake_docker_env(tmp, present=True)
             env["FAKE_DOCKER_RUN_CODE"] = "0"
             self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A"], env=env).returncode, 0)
-            self.add_binary(root)
-            result = self.run_cli(["--experiments-root", str(root), "run", "EXP_A", "--run-id", "MPIBLOCK", "--image", "fake/image"], env=env)
-            self.assertEqual(result.returncode, 4, result.stderr)
-            run_dir = root / "EXP_A" / "runs" / "MPIBLOCK"
-            self.assertFalse((run_dir / "work" / "run_inside_docker.sh").exists())
-            self.assertNotIn("fake docker run", (run_dir / "logs" / "run.log").read_text(encoding="utf-8"))
-            manifest = json.loads((root / "EXP_A" / "metadata" / "manifest.json").read_text(encoding="utf-8"))
-            self.assertEqual(manifest["reporting"]["run_outcome"]["failure_category"], "unsupported_runtime_backend")
-            self.assertEqual(manifest["runtime_execution_plan"]["parallel_backend"], "mpi")
-            self.assertTrue(manifest["runtime_execution_plan"]["blockers"])
+            dry, _ = self.prepare_dry_run_plan(root, run_id="MPIBLOCK", env=env)
+            self.assertEqual(dry.returncode, 11)
+            result = self.run_cli(["--experiments-root", str(root), "run", "EXP_A", "--run-id", "MPIBLOCK"], env=env)
+            self.assertEqual(result.returncode, 11)
+            self.assertIn("blocked", result.stderr)
+            self.assertFalse((root / "EXP_A" / "runs" / "MPIBLOCK" / "work" / "run_inside_docker.sh").exists())
 
-    def test_xios_runtime_plan_blocks_before_docker(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "CROCO_EXPERIMENTS"
-            self.make_exp(root, data=True)
-            self.write_cppdefs_param(root, cppdefs="#define XIOS\n", param="#define LLm 10\n")
-            env = self.fake_docker_env(tmp, present=True)
-            env["FAKE_DOCKER_RUN_CODE"] = "0"
-            self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A"], env=env).returncode, 0)
-            self.add_binary(root)
-            result = self.run_cli(["--experiments-root", str(root), "run", "EXP_A", "--run-id", "XIOSBLOCK", "--image", "fake/image"], env=env)
-            self.assertEqual(result.returncode, 4, result.stderr)
-            run_dir = root / "EXP_A" / "runs" / "XIOSBLOCK"
-            self.assertFalse((run_dir / "work" / "run_inside_docker.sh").exists())
-            self.assertNotIn("fake docker run", (run_dir / "logs" / "run.log").read_text(encoding="utf-8"))
-            manifest = json.loads((root / "EXP_A" / "metadata" / "manifest.json").read_text(encoding="utf-8"))
-            self.assertEqual(manifest["runtime_execution_plan"]["parallel_backend"], "unsupported_complex")
-            self.assertTrue(any("XIOS" in b["description"] for b in manifest["runtime_execution_plan"]["blockers"]))
-
-    def test_run_require_dry_run_enforced(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "CROCO_EXPERIMENTS"
-            self.make_exp(root, data=True)
-            self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A"]).returncode, 0)
-            self.add_binary(root)
-            result = self.run_cli(["--experiments-root", str(root), "run", "EXP_A", "--run-id", "RUN3", "--image", "fake/image", "--require-dry-run"])
-            self.assertEqual(result.returncode, 4)
-            self.assertIn("dry-run report", result.stderr)
-
-    def test_run_require_dry_run_after_matching_report(self):
+    def test_run_missing_runtime_asset_is_materialization_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "CROCO_EXPERIMENTS"
             self.make_exp(root, data=True)
             env = self.fake_docker_env(tmp, present=True)
             env["FAKE_DOCKER_RUN_CODE"] = "0"
             self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A"], env=env).returncode, 0)
-            self.add_binary(root)
-            self.seed_compile_attempt(root)
-            dry = self.run_cli(["--experiments-root", str(root), "dry-run", "EXP_A", "--no-docker", "--run-id", "RUN4"], env=env)
+            dry, _ = self.prepare_dry_run_plan(root, run_id="MISSASSET", env=env)
             self.assertEqual(dry.returncode, 0, dry.stderr)
-            result = self.run_cli(["--experiments-root", str(root), "run", "EXP_A", "--run-id", "RUN4", "--image", "fake/image", "--require-dry-run"], env=env)
-            self.assertEqual(result.returncode, 0, result.stderr)
-
-    def test_run_missing_referenced_asset_reaches_croco_attempt(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "CROCO_EXPERIMENTS"
-            self.make_exp(root, data=False)
-            env = self.fake_docker_env(tmp, present=True)
-            env["FAKE_DOCKER_RUN_CODE"] = "0"
-            self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A"]).returncode, 0)
-            self.add_binary(root)
-            result = self.run_cli(["--experiments-root", str(root), "run", "EXP_A", "--run-id", "RUN5", "--image", "fake/image"], env=env)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            report = root / "EXP_A" / "runs" / "RUN5" / "reports" / "run_report.md"
-            self.assertTrue(report.exists())
-            manifest = json.loads((root / "EXP_A" / "metadata" / "manifest.json").read_text(encoding="utf-8"))
-            self.assertEqual(manifest["runtime_materialization"]["symlinked_runtime_data"], [])
-            self.assertEqual(manifest["reporting"]["run_outcome"]["failure_category"], "none")
-
-    def test_run_blocked_materialization_does_not_generate_wrapper_or_start_docker(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "CROCO_EXPERIMENTS"
-            exp = self.make_exp(root, data=False)
-            outside = Path(tmp) / "outside.nc"
-            outside.write_bytes(b"outside")
-            (exp / "input" / "unsafe.nc").symlink_to(outside)
-            env = self.fake_docker_env(tmp, present=True)
-            env["FAKE_DOCKER_RUN_CODE"] = "0"
-            self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A"], env=env).returncode, 0)
-            self.add_binary(root)
-            result = self.run_cli(["--experiments-root", str(root), "run", "EXP_A", "--run-id", "RUNBLOCK", "--image", "fake/image"], env=env)
-            self.assertEqual(result.returncode, 4, result.stderr)
-            run_dir = root / "EXP_A" / "runs" / "RUNBLOCK"
+            (root / "EXP_A" / "input" / "forcing.nc").unlink()
+            result = self.run_cli(["--experiments-root", str(root), "run", "EXP_A", "--run-id", "MISSASSET"], env=env)
+            self.assertEqual(result.returncode, 12)
+            run_dir = root / "EXP_A" / "runs" / "MISSASSET"
             self.assertFalse((run_dir / "work" / "run_inside_docker.sh").exists())
-            log = (run_dir / "logs" / "run.log").read_text(encoding="utf-8")
-            self.assertNotIn("fake docker run", log)
-            manifest = json.loads((root / "EXP_A" / "metadata" / "manifest.json").read_text(encoding="utf-8"))
-            self.assertEqual(manifest["reporting"]["run_outcome"]["failure_category"], "metadata_or_staging")
-            self.assertEqual(manifest["docker_backend"]["run_command_summary"], "not attempted; runtime planning or workdir materialization blocked")
+            self.assertNotIn("fake docker run", (run_dir / "logs" / "run_stdout.log").read_text(encoding="utf-8"))
+            attempt = json.loads((run_dir / "reports" / "run_attempt.json").read_text(encoding="utf-8"))
+            self.assertEqual(attempt["failure_category"], "materialization_failed")
+            self.assertTrue(attempt["blockers"])
 
-    def test_run_env_ignored_and_unresolved_tokens_warn_without_substitution(self):
+    def test_run_missing_materialization_plan_maps_to_exit_12(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "CROCO_EXPERIMENTS"
-            exp = self.make_exp(root, croco_text="TITLE == ${CASE_NAME}\n")
-            (exp / "input" / "run.env").write_text("CASE_NAME=replaced\n", encoding="utf-8")
-            env = self.fake_docker_env(tmp, present=True)
-            env["FAKE_DOCKER_RUN_CODE"] = "0"
-            self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A"], env=env).returncode, 0)
-            self.add_binary(root)
-            result = self.run_cli(["--experiments-root", str(root), "run", "EXP_A", "--run-id", "RUNENV", "--image", "fake/image"], env=env)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            work_croco = root / "EXP_A" / "runs" / "RUNENV" / "work" / "croco.in"
-            self.assertIn("${CASE_NAME}", work_croco.read_text(encoding="utf-8"))
-            self.assertNotIn("replaced", work_croco.read_text(encoding="utf-8"))
-            manifest = json.loads((root / "EXP_A" / "metadata" / "manifest.json").read_text(encoding="utf-8"))
-            warnings = "\n".join(manifest["reporting"]["warnings"])
-            self.assertIn("run.env is ignored", warnings)
-            self.assertIn("${CASE_NAME}", warnings)
+            self.make_exp(root, data=True)
+            self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A"]).returncode, 0)
+            dry, _ = self.prepare_dry_run_plan(root, run_id="NOMAT")
+            self.assertEqual(dry.returncode, 0, dry.stderr)
+            plan_path = root / "EXP_A" / "metadata" / "dry_run_plan.json"
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+            plan.pop("runtime_materialization")
+            plan_path.write_text(json.dumps(plan, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            result = self.run_cli(["--experiments-root", str(root), "run", "EXP_A", "--run-id", "NOMAT"])
+            self.assertEqual(result.returncode, 12)
+            self.assertIn("materialization", result.stderr)
 
-    def test_run_reports_findings_without_blocking_by_default(self):
+    def test_run_docker_backend_failures_and_nonzero_execution_codes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "CROCO_EXPERIMENTS"
-            self.make_exp(root, analytical=True, data=True)
-            env = self.fake_docker_env(tmp, present=True)
+            self.make_exp(root, data=True)
+            env = {"PATH": str(Path(tmp) / "empty-bin"), "CROCOEXP_REPO_ROOT": str(Path(tmp) / "repo")}
+            Path(env["PATH"]).mkdir()
+            self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A"], env=env).returncode, 0)
+            dry, _ = self.prepare_dry_run_plan(root, run_id="NODOCKER", env=env)
+            self.assertEqual(dry.returncode, 0, dry.stderr)
+            result = self.run_cli(["--experiments-root", str(root), "run", "EXP_A", "--run-id", "NODOCKER"], env=env)
+            self.assertEqual(result.returncode, 7)
+            attempt = json.loads((root / "EXP_A" / "runs" / "NODOCKER" / "reports" / "run_attempt.json").read_text(encoding="utf-8"))
+            self.assertEqual(attempt["failure_category"], "docker_backend")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "CROCO_EXPERIMENTS"
+            self.make_exp(root, data=True)
+            env = self.fake_docker_env(tmp, present=True, daemon=False)
             env["FAKE_DOCKER_RUN_CODE"] = "0"
             self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A"], env=env).returncode, 0)
-            self.add_binary(root)
-            result = self.run_cli(["--experiments-root", str(root), "run", "EXP_A", "--run-id", "RUN6", "--image", "fake/image"], env=env)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            manifest = json.loads((root / "EXP_A" / "metadata" / "manifest.json").read_text(encoding="utf-8"))
-            self.assertTrue(manifest["reporting"]["possible_mismatches"])
+            dry, _ = self.prepare_dry_run_plan(root, run_id="DAEMON", env=env)
+            self.assertEqual(dry.returncode, 0, dry.stderr)
+            result = self.run_cli(["--experiments-root", str(root), "run", "EXP_A", "--run-id", "DAEMON"], env=env)
+            self.assertEqual(result.returncode, 7)
+            attempt = json.loads((root / "EXP_A" / "runs" / "DAEMON" / "reports" / "run_attempt.json").read_text(encoding="utf-8"))
+            self.assertEqual(attempt["failure_category"], "docker_backend")
 
-    def test_run_records_docker_command_and_failure_category(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "CROCO_EXPERIMENTS"
             self.make_exp(root, data=True)
             env = self.fake_docker_env(tmp, present=True)
             env["FAKE_DOCKER_RUN_CODE"] = "9"
             self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A"], env=env).returncode, 0)
-            self.add_binary(root)
-            result = self.run_cli(["--experiments-root", str(root), "run", "EXP_A", "--run-id", "RUN7", "--image", "fake/image"], env=env)
-            self.assertEqual(result.returncode, 9)
+            dry, _ = self.prepare_dry_run_plan(root, run_id="NONZERO", env=env)
+            self.assertEqual(dry.returncode, 0, dry.stderr)
+            result = self.run_cli(["--experiments-root", str(root), "run", "EXP_A", "--run-id", "NONZERO"], env=env)
+            self.assertEqual(result.returncode, 13)
             manifest = json.loads((root / "EXP_A" / "metadata" / "manifest.json").read_text(encoding="utf-8"))
-            self.assertIn("docker run", manifest["docker_backend"]["run_command_summary"])
             self.assertEqual(manifest["reporting"]["run_outcome"]["failure_category"], "run_failure")
 
 

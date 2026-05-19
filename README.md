@@ -109,10 +109,15 @@ Generate a pre-execution report without running CROCO:
 Attempt a CROCO run through Docker:
 
 ```bash
+./crocoexp run minimal
+./crocoexp run minimal --run-id test-run-001
+./crocoexp run minimal --json
 ./crocoexp run my_experiment
 ```
 
-Explicit `--image` overrides are available on Docker-backed commands. When no explicit image is provided, commands use the repo setup default image if present, then the built-in default image.
+`run` consumes `metadata/dry_run_plan.json`, materializes a run-local workdir under `runs/<run_id>/work/`, exposes runtime data assets using relative symlinks back to `input/`, and launches CROCO through Docker as a backend. It does not compile CROCO. It records logs, snapshots, output inventory, `runs/<run_id>/reports/run_attempt.json`, and `runs/<run_id>/reports/run_report.md`.
+
+Run success records an execution attempt only. It does not prove scientific correctness, runtime semantic compatibility, or experiment well-posedness. MPI, XIOS, OASIS, AGRIF, and other specialized execution profiles remain out of scope for v1.0.0 unless explicitly implemented and tested.
 
 ## Directory Layout
 
@@ -219,7 +224,7 @@ When one of these exact active symbols requires a specialized runtime profile, C
 
 `dry-run` does not run CROCO, validate every CROCO input syntax, or decide whether a NetCDF file contains all variables CROCO expects.
 
-`run` creates `runs/<run_id>/work/`, copies `croco.in`, places the compiled binary as `croco`, creates runtime data symlinks, writes `run_inside_docker.sh`, runs Docker from the workdir, captures logs, and copies generated regular outputs into `runs/<run_id>/output/`. The original `input/` tree remains untouched.
+`run` creates `runs/<run_id>/work/`, symlinks `croco.in` and the compiled binary into that workdir, creates relative runtime data symlinks, writes `run_inside_docker.sh`, runs Docker from the workdir, captures logs, snapshots small provenance files, and inventories observed outputs. The original `input/` tree remains untouched.
 
 ## Traceability Model
 
