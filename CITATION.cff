@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+date-released: "ADD_RELEASE_DATE"
+title: CROCOEXP Builder
+message: "If you use CROCOEXP Builder, please cite it using the metadata in this file."
+type: software
+authors:
+  - family-names: Badagnani
+    given-names: Daniel
+    affiliation: Universidad Nacional de Tierra del Fuego
+version: 1.0.0
+repository-code: "https://github.com/domar1973/CROCOEXP_BUILDER"
+abstract: "A reproducible experiment orchestration layer for compiling and running single-configuration CROCO experiments."
+keywords:
+  - CROCO
+  - ROMS
+  - ocean modeling
+  - reproducible experiments
+  - coastal oceanography
+license: CC-BY-4.0

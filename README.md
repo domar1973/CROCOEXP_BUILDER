@@ -20,6 +20,8 @@ The builder is infrastructure-oriented and traceability-oriented. It does not pr
 
 ## Repository Commands
 
+Development note: this repository is implementing v1.0.0 in small slices. The current implemented slices lock the CLI surface, implement repo-level `setup` for Docker backend readiness, implement the repo-level source registry commands, and import existing experiment input trees into generated metadata.
+
 Check and record Docker backend readiness:
 
 ```bash
@@ -29,7 +31,7 @@ Check and record Docker backend readiness:
 Use `--pull` when you want setup to pull the selected image if it is missing:
 
 ```bash
-./crocoexp setup --pull
+./crocoexp setup --image domarcroco/images-for-croco:base_croco_msot-1.0.0 --pull
 ```
 
 Register a compile source tree by copying it into the managed sources area:
@@ -66,26 +68,43 @@ CROCO_EXPERIMENTS/my_experiment/
 Import the experiment and select its compile source:
 
 ```bash
+./crocoexp import minimal
+./crocoexp import minimal --source croco-msot-local
 ./crocoexp import my_experiment --source croco-v2.1.2
 ```
+
+`input/` is the canonical user-provided evidence folder. Import writes generated metadata under `metadata/`, creates managed `build/` and `runs/` directories if needed, and does not modify `input/`. Import with `--source` records a per-experiment source reference; it does not select a global CROCO version, compile CROCO, or run CROCO.
+
+During import, `croco.in` is recorded as an artifact but is not treated as universal CROCO semantic truth. `run.env`, if present, is ignored and recorded with a warning.
 
 Inspect current metadata:
 
 ```bash
+./crocoexp inspect minimal
+./crocoexp inspect minimal --json
 ./crocoexp inspect my_experiment
 ```
+
+`inspect` is read-only. It reads `metadata/manifest.json`, reports recorded artifact-level findings and warnings, and does not modify `input/`, metadata, source registry state, or setup config. It does not compile, dry-run, or run CROCO, and it does not prove scientific correctness, compile correctness, runtime semantic compatibility, or experiment well-posedness.
 
 Compile through Docker from the host:
 
 ```bash
+./crocoexp compile minimal
 ./crocoexp compile my_experiment
 ```
+
+`compile` uses the per-experiment source reference recorded during import. Docker is used only as the backend; build staging, logs, `metadata/compile_attempt.json`, and `metadata/compile_report.md` are written outside `input/`. Compile does not run CROCO, and compile success does not prove scientific correctness or runtime semantic compatibility.
 
 Generate a pre-execution report without running CROCO:
 
 ```bash
+./crocoexp dry-run minimal
+./crocoexp dry-run minimal --json
 ./crocoexp dry-run my_experiment
 ```
+
+`dry-run` is host-side planning only. It consumes import and compile metadata, does not compile CROCO, does not launch CROCO, keeps runtime data canonical in `input/`, and plans relative symlinks from a future run-local workdir to NetCDF-like runtime data assets. Runtime execution profile planning is derived from compile-time evidence such as `cppdefs.h` and `param.h`, not from `croco.in`. It writes `metadata/dry_run_plan.json` and `metadata/dry_run_report.md`.
 
 Attempt a CROCO run through Docker:
 

@@ -9,6 +9,17 @@ def build_parser():
     parser = argparse.ArgumentParser(
         prog="crocoexp",
         description="Host-side CROCO experiment builder commands.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""v1.0.0 command surface:
+  setup
+  source install
+  source list
+  source inspect
+  import
+  inspect
+  compile
+  dry-run
+  run""",
     )
     parser.add_argument(
         "--experiments-root",

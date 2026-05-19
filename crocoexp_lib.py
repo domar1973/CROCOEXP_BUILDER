@@ -9,6 +9,7 @@ from pathlib import Path
 
 
 SCHEMA_VERSION = "0.1"
+SOURCE_REGISTRY_SCHEMA_VERSION = 1
 CONTAINER_ROOT = "/opt/CROCO_EXPERIMENTS"
 DEFAULT_DOCKER_IMAGE = "domarcroco/images-for-croco:base_croco_msot-1.0.0"
 DOCKER_NETCDFLIB = "-L/opt/intel/netcdf/lib -L/opt/intel/netcdff/lib  -lnetcdff -lnetcdf"
@@ -57,6 +58,7 @@ def experiments_root(args):
 
 
 def experiment_paths(args):
+    validate_experiment_name(args.experiment_name)
     exp_root = experiments_root(args) / args.experiment_name
     return {
         "experiments_root": experiments_root(args),
@@ -137,6 +139,30 @@ def detect_source_layout(path):
     if (path / "OCEAN").is_dir():
         return "ocean_subdir_without_jobcomp"
     return "unknown"
+
+
+def source_tree_stats(path):
+    files_count = 0
+    bytes_count = 0
+    for item in path.rglob("*"):
+        if item.is_file():
+            files_count += 1
+            try:
+                bytes_count += item.stat().st_size
+            except OSError:
+                pass
+    return files_count, bytes_count
+
+
+def detect_source_features(path):
+    files = [p for p in path.rglob("*") if p.is_file()]
+    lower_names = {p.name.lower() for p in files}
+    return {
+        "has_cppdefs": any(p.name == "cppdefs.h" for p in files),
+        "has_param": any(p.name == "param.h" for p in files),
+        "has_jobcomp": any(p.name == "jobcomp" for p in files),
+        "has_makefile": "makefile" in lower_names,
+    }
 
 
 def file_kind(path):
@@ -667,13 +693,39 @@ def asset_item(path, input_dir, exps_root):
     }
 
 
+def import_file_entry(path, experiment_root, kind):
+    stat = path.stat()
+    return {
+        "path": rel_to(path, experiment_root),
+        "kind": kind,
+        "size_bytes": stat.st_size,
+        "sha256": sha256_file(path),
+    }
+
+
+def import_command_string(args):
+    parts = ["crocoexp", "import", args.experiment_name]
+    source_id = getattr(args, "source_id", None)
+    if source_id:
+        parts.extend(["--source", source_id])
+    return " ".join(parts)
+
+
 def empty_manifest(name, paths):
     now = utc_now()
     exps_root = paths["experiments_root"]
     exp_root = paths["experiment_root"]
     return {
-        "schema_version": {"version": SCHEMA_VERSION, "created_by": "crocoexp"},
-        "experiment": {"name": name, "root_host_path": str(exp_root), "created_at": now, "updated_at": now},
+        "schema_version": 1,
+        "implementation_schema": {"version": SCHEMA_VERSION, "created_by": "crocoexp"},
+        "experiment": {
+            "name": name,
+            "root": str(exp_root),
+            "input_dir": str(paths["input"]),
+            "root_host_path": str(exp_root),
+            "created_at": now,
+            "updated_at": now,
+        },
         "paths": {
             "experiments_root_host_path": str(exps_root),
             "experiment_root_host_path": str(exp_root),
@@ -724,9 +776,9 @@ def write_manifest(manifest, path):
 
 def ensure_importable(paths):
     if not paths["experiment_root"].is_dir():
-        raise CrocoexpError(f"missing experiment directory: {paths['experiment_root']}", 3, "missing_artifact")
+        raise CrocoexpError(f"missing experiment directory: {paths['experiment_root']}", 6, "missing_experiment_input")
     if not paths["input"].is_dir():
-        raise CrocoexpError(f"missing input directory: {paths['input']}", 3, "missing_artifact")
+        raise CrocoexpError(f"missing input directory: {paths['input']}", 6, "missing_experiment_input")
     missing = [name for name in PRIMARY_ARTIFACTS if not (paths["input"] / name).is_file()]
     if missing:
         raise CrocoexpError(f"missing required input artifact(s): {', '.join(missing)}", 3, "missing_artifact")
@@ -765,6 +817,25 @@ def refresh_manifest(args, command_name="import", record_command=True):
     counts = {}
     for asset in assets:
         counts[asset["classification"]] = counts.get(asset["classification"], 0) + 1
+    primary_entries = {
+        "croco_in": None,
+        "cppdefs_h": None,
+        "param_h": None,
+        "analytical_f": None,
+    }
+    runtime_data_entries = []
+    ordinary_entries = []
+    ignored_entries = []
+    for path in files:
+        role = role_for(path)
+        if role in primary_entries:
+            primary_entries[role] = import_file_entry(path, paths["experiment_root"], "primary_artifact")
+        elif path.suffix.lower() in DATA_SUFFIXES:
+            runtime_data_entries.append(import_file_entry(path, paths["experiment_root"], "runtime_data_asset"))
+        elif path.name == "run.env":
+            ignored_entries.append(import_file_entry(path, paths["experiment_root"], "ignored_user_file"))
+        else:
+            ordinary_entries.append(import_file_entry(path, paths["experiment_root"], "ordinary_user_file"))
 
     analytical = paths["input"] / "analytical.F"
     warnings = list(token_warnings)
@@ -809,12 +880,26 @@ def refresh_manifest(args, command_name="import", record_command=True):
         "findings": ["input/croco.in is treated as opaque; CROCOEXP does not infer runtime assets from it."],
     }
     manifest["runtime_materialization"] = runtime_materialization_plan(paths, None, None)
+    manifest["runtime_materialization"]["status"] = "not_prepared"
     manifest["runtime_execution_plan"] = execution_plan
+    manifest["runtime_execution_plan"]["status"] = "not_planned"
     manifest["capabilities"] = []
     manifest["assets"] = {
         "inventory": assets,
         "classification_counts": counts,
         "selected_mounts": selected_mounts,
+    }
+    manifest["import"] = {
+        "imported_at": utc_now(),
+        "command": import_command_string(args),
+        "status": "imported",
+        "warnings": warnings,
+    }
+    manifest["evidence"] = {
+        "primary_artifacts": primary_entries,
+        "runtime_data_assets": runtime_data_entries,
+        "ordinary_user_files": ordinary_entries,
+        "ignored_user_files": ignored_entries,
     }
     manifest["reporting"] = {
         "status": "reported_with_warnings" if warnings else "reported_clean",
@@ -840,6 +925,12 @@ def refresh_manifest(args, command_name="import", record_command=True):
         }
     ]
     if record_command:
+        import_reports = []
+        if command_name == "import":
+            import_reports = [
+                str(paths["metadata"] / "import_report.md"),
+                str(paths["metadata"] / "report.md"),
+            ]
         append_command(
             manifest,
             command_name,
@@ -848,7 +939,7 @@ def refresh_manifest(args, command_name="import", record_command=True):
             staging_decisions=[],
             mappings=selected_mounts,
             logs=[],
-            reports=[str(paths["metadata"] / "import_report.md")] if command_name == "import" else [],
+            reports=import_reports,
             warnings=warnings,
             findings=findings,
             failure_category="none",
@@ -894,19 +985,36 @@ def append_command(manifest, command, arguments, inputs_used, staging_decisions,
 def write_import_report(manifest, path):
     exp = manifest["experiment"]
     counts = manifest["assets"]["classification_counts"]
+    primary = manifest.get("evidence", {}).get("primary_artifacts", {})
+    source_ref = manifest.get("compile_time", {}).get("source_ref") or {}
+    source_id = source_ref.get("source_id") if isinstance(source_ref, dict) else None
     lines = [
         "# Import Report",
         "",
         f"- Experiment: {exp['name']}",
         f"- Root: {exp['root_host_path']}",
+        f"- Input directory: {manifest['paths']['input_host_path']}",
+        f"- Imported at: {manifest.get('import', {}).get('imported_at') or manifest['experiment']['updated_at']}",
         f"- Manifest: {path.parent / 'manifest.json'}",
         f"- Evidence count: {len(manifest['input_evidence'])}",
         f"- analytical.F: {manifest['compile_time']['analytical_finding']}",
-        f"- Compile source: {manifest['compile_time'].get('source_ref') or 'none'}",
-        f"- Asset classifications: {counts}",
+        f"- Selected source ID: {source_id or 'none'}",
+        f"- Runtime data asset count: {counts.get('runtime_data', 0)}",
+        f"- Ordinary user file count: {len(manifest.get('evidence', {}).get('ordinary_user_files', []))}",
+        f"- Ignored user file count: {len(manifest.get('evidence', {}).get('ignored_user_files', []))}",
+        "",
+        "## Primary Artifacts",
+    ]
+    for name, entry in primary.items():
+        lines.append(f"- {name}: {'found' if entry else 'missing'}")
+    lines.extend([
+        "",
+        "## Scope Disclaimer",
+        "",
+        "Import records artifact-level findings only. It does not prove scientific correctness, compile correctness, runtime semantic compatibility, or experiment well-posedness.",
         "",
         "## Warnings",
-    ]
+    ])
     warnings = manifest["reporting"].get("warnings", [])
     lines.extend([f"- {w}" for w in warnings] or ["- none"])
     lines.extend(["", "## Findings"])
@@ -944,7 +1052,7 @@ def configured_default_image():
 def load_source_registry():
     path = setup_paths()["sources"]
     if not path.exists():
-        return {"schema_version": SCHEMA_VERSION, "sources": {}}
+        return {"schema_version": SOURCE_REGISTRY_SCHEMA_VERSION, "sources": {}}
     try:
         with path.open("r", encoding="utf-8") as f:
             registry = json.load(f)
@@ -952,7 +1060,7 @@ def load_source_registry():
         raise CrocoexpError(f"unable to read source registry {path}: {e}", 4, "metadata_or_staging")
     if "sources" not in registry or not isinstance(registry["sources"], dict):
         raise CrocoexpError(f"invalid source registry shape: {path}", 4, "metadata_or_staging")
-    registry.setdefault("schema_version", SCHEMA_VERSION)
+    registry.setdefault("schema_version", SOURCE_REGISTRY_SCHEMA_VERSION)
     return registry
 
 
@@ -970,8 +1078,13 @@ def write_source_registry(registry):
 
 
 def validate_source_id(source_id):
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+", source_id or ""):
+    if source_id in {".", ".."} or not re.fullmatch(r"[A-Za-z0-9_.-]+", source_id or ""):
         raise CrocoexpError(f"invalid source id: {source_id}", 2, "invalid_usage")
+
+
+def validate_experiment_name(experiment_name):
+    if experiment_name in {".", ".."} or not re.fullmatch(r"[A-Za-z0-9_.-]+", experiment_name or ""):
+        raise CrocoexpError(f"invalid experiment name: {experiment_name}", 2, "invalid_usage")
 
 
 def source_ref_from_record(record, selection_source):
@@ -980,13 +1093,15 @@ def source_ref_from_record(record, selection_source):
         "flavor": record.get("flavor"),
         "declared_version": record.get("declared_version"),
         "host_path": record.get("host_path"),
+        "installed_path": record.get("installed_path") or record.get("host_path"),
         "container_path": record.get("container_path"),
-        "registry_path": str(setup_paths()["sources"]),
+        "registry_path": ".crocoexp/sources.json",
         "origin_path": record.get("origin_path"),
         "git_commit": record.get("git_commit"),
         "git_branch": record.get("git_branch"),
         "detected_layout": record.get("detected_layout"),
         "content_hash": record.get("content_hash"),
+        "status": "registered",
         "selected_at": utc_now(),
         "selection_source": selection_source,
     }
@@ -997,10 +1112,10 @@ def resolve_registered_source(source_id, selection_source):
     registry = load_source_registry()
     record = registry["sources"].get(source_id)
     if record is None:
-        raise CrocoexpError(f"unknown registered source id: {source_id}; install it with 'crocoexp source install'", 4, "metadata_or_staging")
+        raise CrocoexpError(f"unknown registered source id: {source_id}; install it with 'crocoexp source install'", 5, "source_not_found")
     host_path = Path(record.get("host_path", ""))
     if not host_path.is_dir():
-        raise CrocoexpError(f"registered source tree is missing on disk: {host_path}", 3, "missing_artifact")
+        raise CrocoexpError(f"registered source tree is missing on disk: {host_path}", 5, "source_not_found")
     return source_ref_from_record(record, selection_source)
 
 
@@ -1087,14 +1202,43 @@ def setup_summary(config):
         "config_path": str(setup_paths()["config"]),
         "report_path": str(setup_paths()["report"]),
         "default_docker_image": config["default_docker_image"],
+        "previous_default_docker_image": config.get("previous_default_docker_image"),
         "docker_cli_detected": config["docker_cli_detected"],
+        "docker_cli_path": config.get("docker_cli_path"),
+        "docker_version": config.get("docker_version"),
         "docker_daemon_ok": config["docker_daemon_ok"],
         "image_present_locally": config["image_present_locally"],
+        "image_id": config.get("image_id"),
+        "image_checked_at": config.get("image_checked_at"),
         "image_pulled": config.get("image_pulled", False),
+        "pull_attempted": config.get("pull_attempted", False),
+        "pull_result": config.get("pull_result"),
         "setup_status": config["setup_status"],
         "failure_category": config.get("failure_category"),
         "warnings_count": len(config.get("warnings", [])),
+        "commands": config.get("commands", []),
     }
+
+
+def yes_no(value):
+    return "yes" if bool(value) else "no"
+
+
+def print_setup_summary(config):
+    summary = setup_summary(config)
+    print(f"Docker CLI detected: {yes_no(summary['docker_cli_detected'])}")
+    print(f"Docker daemon available: {yes_no(summary['docker_daemon_ok'])}")
+    print(f"Selected Docker image: {summary['default_docker_image']}")
+    print(f"Previous default image: {summary['previous_default_docker_image'] or 'none'}")
+    print(f"Image present locally: {yes_no(summary['image_present_locally'])}")
+    print(f"Image pull attempted: {yes_no(summary['pull_attempted'])}")
+    if summary["pull_attempted"]:
+        print(f"Image pull result: {summary['pull_result'] or 'unknown'}")
+    print(f"Setup config path: {summary['config_path']}")
+    print(f"Setup report path: {summary['report_path']}")
+    print(f"Warning count: {summary['warnings_count']}")
+    print(f"Failure category: {summary['failure_category'] or 'none'}")
+    print(f"Setup status: {summary['setup_status']}")
 
 
 def cmd_setup(args):
@@ -1189,8 +1333,10 @@ def cmd_setup(args):
         print(f"ERROR: {e}", file=os.sys.stderr)
         return e.exit_code
 
-    summary = setup_summary(config)
-    print_or_json(summary, args.json)
+    if args.json:
+        print(json.dumps(setup_summary(config), indent=2, sort_keys=True))
+    else:
+        print_setup_summary(config)
     if failure_category in {"docker_cli_missing", "docker_daemon_unavailable", "image_missing", "image_pull_failed"}:
         return 7
     return 0
@@ -1221,6 +1367,8 @@ def cmd_source_install(args):
         except OSError as e:
             raise CrocoexpError(f"unable to copy source tree to {dest}: {e}", 4, "metadata_or_staging")
 
+        files_count, bytes_count = source_tree_stats(dest)
+        detection = detect_source_features(dest)
         record = {
             "source_id": args.source_id,
             "host_path": str(dest),
@@ -1229,11 +1377,19 @@ def cmd_source_install(args):
             "declared_version": args.declared_version,
             "installed_at": utc_now(),
             "origin_path": str(origin),
+            "installed_from": str(origin),
+            "installed_path": str(dest),
+            "status": "installed",
+            "files_count": files_count,
+            "bytes_count": bytes_count,
+            "detection": detection,
+            "warnings": [],
             "notes": args.notes,
             "git_commit": git_value(origin, ["rev-parse", "HEAD"]),
             "git_branch": git_value(origin, ["rev-parse", "--abbrev-ref", "HEAD"]),
             "content_hash": sha256_tree(dest),
             "detected_layout": detect_source_layout(dest),
+            "installed_by_command": "source install",
         }
         registry["sources"][args.source_id] = record
         write_source_registry(registry)
@@ -1285,9 +1441,12 @@ def cmd_import(args):
     try:
         manifest, paths = refresh_manifest(args, "import")
         report = paths["metadata"] / "import_report.md"
+        canonical_report = paths["metadata"] / "report.md"
         write_import_report(manifest, report)
+        write_import_report(manifest, canonical_report)
         summary = manifest_summary(manifest)
         summary["import_report"] = str(report)
+        summary["report"] = str(canonical_report)
         print_or_json(summary, args.json)
         return 0
     except CrocoexpError as e:
@@ -1302,43 +1461,195 @@ def manifest_summary(manifest):
     commands = manifest.get("commands", [])
     last = commands[-1] if commands else None
     primary = {item["role"]: item["exists"] for item in manifest.get("input_evidence", []) if item["role"] in {"croco_in", "cppdefs_h", "param_h"}}
+    counts = manifest.get("assets", {}).get("classification_counts", {})
     return {
+        "experiment_name": manifest["experiment"]["name"],
         "experiment_root": manifest["experiment"]["root_host_path"],
+        "manifest_path": str(Path(manifest["paths"]["metadata_host_path"]) / "manifest.json"),
         "primary_artifacts": primary,
         "analytical_F": manifest.get("compile_time", {}).get("analytical_finding"),
         "compile_source": manifest.get("compile_time", {}).get("source_ref"),
         "evidence_count": len(manifest.get("input_evidence", [])),
-        "asset_classification_counts": manifest.get("assets", {}).get("classification_counts", {}),
+        "netcdf_runtime_data_asset_count": counts.get("runtime_data", 0),
+        "asset_classification_counts": counts,
         "warnings_count": len(manifest.get("reporting", {}).get("warnings", [])),
         "findings_count": len(manifest.get("compile_time", {}).get("findings", [])) + len(manifest.get("runtime", {}).get("findings", [])),
         "last_command_status": None if last is None else {"command": last["command"], "failure_category": last["failure_category"], "exit_code": last["exit_code"]},
     }
 
 
+INSPECT_DISCLAIMER = (
+    "Inspect reports recorded artifact-level findings only; it does not prove scientific correctness, "
+    "compile correctness, runtime semantic compatibility, or experiment well-posedness."
+)
+
+
+def primary_artifact_summary(manifest):
+    primary = manifest.get("evidence", {}).get("primary_artifacts", {})
+    legacy = {
+        item["role"]: item
+        for item in manifest.get("input_evidence", [])
+        if item.get("role") in {"croco_in", "cppdefs_h", "param_h", "analytical_f"}
+    }
+    result = {}
+    for key in ("croco_in", "cppdefs_h", "param_h", "analytical_f"):
+        entry = primary.get(key) or legacy.get(key)
+        result[key] = {
+            "present": entry is not None,
+            "path": entry.get("path") or f"input/{entry.get('relative_path_from_input')}" if entry else None,
+            "kind": entry.get("kind") if entry else None,
+        }
+    return result
+
+
+def inspect_read_only_checks(manifest, paths):
+    warnings = []
+
+    if not paths["experiment_root"].is_dir():
+        warnings.append(f"experiment root missing: {paths['experiment_root']}")
+    if not paths["input"].is_dir():
+        warnings.append(f"input directory missing: {paths['input']}")
+    if not paths["manifest"].is_file():
+        warnings.append(f"manifest missing: {paths['manifest']}")
+
+    primary = manifest.get("evidence", {}).get("primary_artifacts", {})
+    for name, entry in primary.items():
+        if entry and not (paths["experiment_root"] / entry["path"]).exists():
+            warnings.append(f"recorded primary artifact missing: {entry['path']} ({name})")
+
+    for entry in manifest.get("evidence", {}).get("runtime_data_assets", []):
+        if not (paths["experiment_root"] / entry["path"]).exists():
+            warnings.append(f"recorded runtime data asset missing: {entry['path']}")
+
+    source_ref = manifest.get("compile_time", {}).get("source_ref")
+    if isinstance(source_ref, dict):
+        installed_path = source_ref.get("installed_path") or source_ref.get("host_path")
+        if installed_path and not Path(installed_path).exists():
+            warnings.append(f"recorded source installed path missing: {installed_path}")
+
+    return {"warnings": warnings}
+
+
+def inspect_summary(manifest, paths):
+    evidence = manifest.get("evidence", {})
+    source_ref = manifest.get("compile_time", {}).get("source_ref")
+    primary = primary_artifact_summary(manifest)
+    reporting_warnings = manifest.get("reporting", {}).get("warnings", [])
+    read_only_checks = inspect_read_only_checks(manifest, paths)
+    ignored = evidence.get("ignored_user_files", [])
+    run_env_ignored = any(entry.get("path") == "input/run.env" for entry in ignored)
+    imported_at = manifest.get("import", {}).get("imported_at")
+    return {
+        "experiment_name": manifest.get("experiment", {}).get("name"),
+        "experiment_root": str(paths["experiment_root"]),
+        "input_dir": str(paths["input"]),
+        "manifest_path": str(paths["manifest"]),
+        "import_status": manifest.get("import", {}).get("status"),
+        "imported_at": imported_at,
+        "warning_count": len(reporting_warnings) + len(read_only_checks["warnings"]),
+        "primary_artifacts": primary,
+        "runtime_data_asset_count": len(evidence.get("runtime_data_assets", [])),
+        "ordinary_user_file_count": len(evidence.get("ordinary_user_files", [])),
+        "ignored_user_file_count": len(ignored),
+        "run_env_ignored": run_env_ignored,
+        "source_ref": source_ref,
+        "runtime_materialization_status": manifest.get("runtime_materialization", {}).get("status"),
+        "runtime_execution_plan_status": manifest.get("runtime_execution_plan", {}).get("status"),
+        "read_only_checks": read_only_checks,
+        "disclaimer": INSPECT_DISCLAIMER,
+    }
+
+
+def print_inspect_summary(summary):
+    print(f"Experiment name: {summary['experiment_name']}")
+    print(f"Experiment root: {summary['experiment_root']}")
+    print(f"Input directory: {summary['input_dir']}")
+    print(f"Manifest path: {summary['manifest_path']}")
+    print(f"Import status: {summary['import_status'] or 'unknown'}")
+    print(f"Import timestamp: {summary['imported_at'] or 'unknown'}")
+    print(f"Warning count: {summary['warning_count']}")
+    print("Primary artifacts:")
+    labels = {
+        "croco_in": "croco.in",
+        "cppdefs_h": "cppdefs.h",
+        "param_h": "param.h",
+        "analytical_f": "analytical.F",
+    }
+    for key, label in labels.items():
+        artifact = summary["primary_artifacts"][key]
+        print(f"- {label}: {'found' if artifact['present'] else 'missing'}")
+    print(f"Runtime data asset count: {summary['runtime_data_asset_count']}")
+    print(f"Ordinary user file count: {summary['ordinary_user_file_count']}")
+    print(f"Ignored user file count: {summary['ignored_user_file_count']}")
+    print(f"run.env ignored: {'yes' if summary['run_env_ignored'] else 'no'}")
+    source_ref = summary.get("source_ref")
+    if isinstance(source_ref, dict) and source_ref.get("source_id"):
+        print(f"Selected source ID: {source_ref['source_id']}")
+        print(f"Source installed path: {source_ref.get('installed_path') or source_ref.get('host_path') or 'unknown'}")
+    else:
+        print("Selected source ID: none")
+    print(f"Runtime materialization status: {summary['runtime_materialization_status'] or 'unknown'}")
+    print(f"Runtime execution plan status: {summary['runtime_execution_plan_status'] or 'unknown'}")
+    print("Read-only warnings:")
+    for warning in summary["read_only_checks"]["warnings"]:
+        print(f"- {warning}")
+    if not summary["read_only_checks"]["warnings"]:
+        print("- none")
+    print(f"Disclaimer: {summary['disclaimer']}")
+
+
 def cmd_inspect(args):
-    paths = experiment_paths(args)
-    manifest = load_manifest(paths["manifest"])
-    if manifest is None:
-        print(f"ERROR: missing manifest: {paths['manifest']}", file=os.sys.stderr)
-        return 4
-    print_or_json(manifest_summary(manifest), args.json)
-    return 0
+    try:
+        paths = experiment_paths(args)
+        if not paths["experiment_root"].is_dir():
+            raise CrocoexpError(f"missing experiment directory: {paths['experiment_root']}", 6, "missing_experiment_input")
+        if not paths["input"].is_dir():
+            raise CrocoexpError(f"missing input directory: {paths['input']}", 6, "missing_experiment_input")
+        if not paths["manifest"].is_file():
+            raise CrocoexpError(f"missing manifest: {paths['manifest']}; run 'crocoexp import {args.experiment_name}' first", 3, "missing_manifest")
+        try:
+            manifest = load_manifest(paths["manifest"])
+        except json.JSONDecodeError as e:
+            raise CrocoexpError(f"malformed manifest JSON: {paths['manifest']}: {e}", 3, "malformed_manifest")
+        except OSError as e:
+            raise CrocoexpError(f"unable to read manifest: {paths['manifest']}: {e}", 3, "unreadable_manifest")
+        summary = inspect_summary(manifest, paths)
+        if args.json:
+            print(json.dumps(summary, indent=2, sort_keys=True))
+        else:
+            print_inspect_summary(summary)
+        return 0
+    except CrocoexpError as e:
+        print(f"ERROR: {e}", file=os.sys.stderr)
+        return e.exit_code
 
 
 def stage_compile_inputs(paths):
     stage = paths["build"] / "stage"
     logs = paths["build"] / "logs"
     output = paths["build"] / "output"
+    if stage.exists():
+        shutil.rmtree(stage)
     stage.mkdir(parents=True, exist_ok=True)
     logs.mkdir(parents=True, exist_ok=True)
     output.mkdir(parents=True, exist_ok=True)
     staged = []
+    experiment_input = stage / "experiment_input"
+    experiment_input.mkdir(parents=True, exist_ok=True)
     for name in ("cppdefs.h", "param.h", "analytical.F"):
         src = paths["input"] / name
         if src.exists():
             dest = stage / name
             shutil.copy2(src, dest)
             staged.append({"source": str(src), "destination": str(dest), "reason": "compile_staging"})
+            nested_dest = experiment_input / name
+            shutil.copy2(src, nested_dest)
+            staged.append({"source": str(src), "destination": str(nested_dest), "reason": "compile_staging_experiment_input_copy"})
+    croco_in = paths["input"] / "croco.in"
+    if croco_in.exists():
+        nested_dest = experiment_input / "croco.in"
+        shutil.copy2(croco_in, nested_dest)
+        staged.append({"source": str(croco_in), "destination": str(nested_dest), "reason": "compile_evidence_copy"})
     missing = [name for name in ("cppdefs.h", "param.h") if not (stage / name).exists()]
     if missing:
         raise CrocoexpError(f"missing compile artifact(s): {', '.join(missing)}", 3, "missing_artifact")
@@ -1351,8 +1662,48 @@ def resolve_compile_source(args, manifest):
         return resolve_registered_source(requested, "compile --source")
     existing = manifest.get("compile_time", {}).get("source_ref")
     if not existing or not existing.get("source_id"):
-        raise CrocoexpError("missing compile source; import with '--source <source_id>' or provide compile --source", 3, "missing_artifact")
+        raise CrocoexpError("missing compile source; import with '--source <source_id>' before compile", 5, "source_not_found")
     return resolve_registered_source(existing["source_id"], "manifest compile_time.source_ref")
+
+
+def detect_compile_entrypoints(source_path):
+    candidates = []
+    for rel in ("jobcomp", "OCEAN/jobcomp", "jobcomp_rsf", "OCEAN/jobcomp_rsf", "Makefile", "makefile", "OCEAN/Makefile", "OCEAN/makefile"):
+        path = source_path / rel
+        if path.exists():
+            candidates.append({"path": str(path), "kind": path.name})
+    return candidates
+
+
+def copy_compile_source_to_stage(source_ref, stage):
+    source_path = Path(source_ref.get("host_path") or source_ref.get("installed_path", ""))
+    staged_source = stage / "source"
+    if staged_source.exists():
+        shutil.rmtree(staged_source)
+    shutil.copytree(source_path, staged_source, symlinks=False)
+    return staged_source
+
+
+def find_compile_binary(paths):
+    candidates = []
+    build = paths["build"]
+    if build.exists():
+        for name in ("croco", "croco.exe", "crocoM", "crocoO"):
+            candidates.extend(sorted(build.rglob(name)))
+    candidates = [p for p in candidates if p.is_file()]
+    executable = [p for p in candidates if os.access(p, os.X_OK)]
+    selected = (executable or candidates or [None])[0]
+    if selected is None:
+        return None
+    return {"path": str(selected), "sha256": sha256_file(selected)}
+
+
+def write_compile_attempt(path, attempt):
+    tmp = path.with_suffix(".json.tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(attempt, f, indent=2, sort_keys=True)
+        f.write("\n")
+    tmp.replace(path)
 
 
 def write_compile_script(paths, stage, output, source_ref):
@@ -1402,16 +1753,29 @@ find . -maxdepth 2 -type f \\( -name 'croco' -o -name 'croco.exe' -o -name '*.ex
     return script
 
 
-def write_compile_report(manifest, report_path, log_path, failure_category, exit_code):
+def write_compile_report(manifest, report_path, log_path, failure_category, exit_code, attempt=None):
+    attempt = attempt or {}
+    logs = attempt.get("logs", {})
+    binary = attempt.get("binary") or {}
     lines = [
         "# Compile Report",
         "",
         f"- Experiment: {manifest['experiment']['name']}",
-        f"- Status: {failure_category}",
-        f"- Exit code: {exit_code}",
-        f"- Log: {log_path}",
-        f"- Docker image: {manifest.get('docker_backend', {}).get('image')}",
-        f"- Compile source: {manifest.get('compile_time', {}).get('source_ref') or 'none'}",
+        f"- Selected source ID: {attempt.get('source_id') or 'none'}",
+        f"- Registered source path: {attempt.get('source_installed_path') or 'unknown'}",
+        f"- Stage directory: {attempt.get('stage_dir') or 'unknown'}",
+        f"- Docker image: {attempt.get('docker_image') or manifest.get('docker_backend', {}).get('image')}",
+        f"- Docker command attempted: {' '.join(attempt.get('docker_command', [])) if attempt.get('docker_command') else 'not attempted'}",
+        f"- Compile status: {attempt.get('status') or failure_category}",
+        f"- Return code: {attempt.get('returncode', exit_code)}",
+        f"- Warning count: {len(attempt.get('warnings', []))}",
+        f"- Stdout log: {logs.get('stdout_path') or log_path}",
+        f"- Stderr log: {logs.get('stderr_path') or log_path}",
+        f"- Detected binary path: {binary.get('path') or 'none'}",
+        "",
+        "## Scope Disclaimer",
+        "",
+        "Compile records a build attempt. Compile success does not prove scientific correctness, runtime semantic compatibility, or experiment well-posedness.",
         "",
         "## Staged Inputs",
     ]
@@ -1834,29 +2198,238 @@ def write_run_report(path, manifest, run_id, image, binary, dry_run_found, count
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def cmd_dry_run(args):
-    paths = experiment_paths(args)
+def load_required_manifest_for_command(paths, experiment_name, command_name):
+    if not paths["experiment_root"].is_dir():
+        raise CrocoexpError(f"missing experiment directory: {paths['experiment_root']}", 6, "missing_experiment_input")
+    if not paths["input"].is_dir():
+        raise CrocoexpError(f"missing input directory: {paths['input']}", 6, "missing_experiment_input")
+    if not paths["manifest"].is_file():
+        raise CrocoexpError(
+            f"missing manifest: {paths['manifest']}; run 'crocoexp import {experiment_name}' first",
+            3,
+            "missing_manifest",
+        )
     try:
-        if not paths["manifest"].exists():
-            raise CrocoexpError(
-                f"missing manifest: {paths['manifest']}; run 'crocoexp import {args.experiment_name}' first",
-                4,
-                "metadata_or_staging",
-            )
-        manifest, paths = refresh_manifest(args, "internal_refresh", record_command=False)
+        return load_manifest(paths["manifest"])
+    except json.JSONDecodeError as e:
+        raise CrocoexpError(f"malformed manifest JSON: {paths['manifest']}: {e}", 3, "malformed_manifest")
+    except OSError as e:
+        raise CrocoexpError(f"unable to read manifest for {command_name}: {paths['manifest']}: {e}", 3, "unreadable_manifest")
+
+
+def load_compile_attempt(paths, manifest):
+    attempt = manifest.get("compile", {}).get("last_attempt")
+    attempt_path = paths["metadata"] / "compile_attempt.json"
+    if attempt is None and attempt_path.is_file():
+        try:
+            attempt = json.loads(attempt_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            attempt = None
+    if attempt is None:
+        raise CrocoexpError("missing successful compile attempt; run 'crocoexp compile' first", 10, "missing_compile_attempt")
+    if attempt.get("status") != "success":
+        raise CrocoexpError("latest compile attempt did not succeed; rerun 'crocoexp compile' successfully before dry-run", 10, "failed_compile_attempt")
+    binary = attempt.get("binary")
+    if not isinstance(binary, dict) or not binary.get("path"):
+        raise CrocoexpError("latest compile attempt has no recorded binary path", 10, "missing_compile_binary")
+    binary_path = Path(binary["path"])
+    if not binary_path.is_file():
+        raise CrocoexpError(f"recorded compile binary is missing on disk: {binary_path}", 10, "missing_compile_binary")
+    return attempt, binary_path
+
+
+def planned_runtime_assets_from_manifest(manifest, paths):
+    assets = manifest.get("evidence", {}).get("runtime_data_assets", [])
+    if not assets:
+        assets = [
+            {
+                "path": f"input/{asset['source_relative_path_from_input']}",
+                "kind": "runtime_data_asset",
+                "size_bytes": asset.get("size_bytes"),
+                "sha256": asset.get("content_hash"),
+            }
+            for asset in manifest.get("runtime_materialization", {}).get("runtime_data_assets", [])
+        ]
+    result = []
+    for asset in assets:
+        rel = asset["path"]
+        abs_path = paths["experiment_root"] / rel
+        result.append(
+            {
+                "asset_path": rel,
+                "absolute_path": str(abs_path),
+                "relative_from_input": str(Path(rel).relative_to("input")) if rel.startswith("input/") else rel,
+                "kind": "netcdf_like",
+                "size_bytes": asset.get("size_bytes"),
+                "sha256": asset.get("sha256"),
+            }
+        )
+    return result
+
+
+def dry_run_materialization_plan(paths, run_id, runtime_assets):
+    workdir = paths["runs"] / run_id / "work"
+    symlinks = []
+    legacy_symlinks = []
+    warnings = []
+    for asset in runtime_assets:
+        rel_from_input = asset["relative_from_input"]
+        link_abs = workdir / rel_from_input
+        asset_abs = paths["experiment_root"] / asset["asset_path"]
+        target = os.path.relpath(asset_abs, start=link_abs.parent)
+        if os.path.isabs(target):
+            warnings.append(f"planned symlink target is unexpectedly absolute for {asset['asset_path']}")
+        symlinks.append(
+            {
+                "link_path": rel_to(link_abs, paths["experiment_root"]),
+                "target_path": target,
+                "asset_path": asset["asset_path"],
+                "kind": asset["kind"],
+                "size_bytes": asset.get("size_bytes"),
+                "sha256": asset.get("sha256"),
+            }
+        )
+        legacy_symlinks.append(
+            {
+                "source_host_path": str(asset_abs),
+                "source_relative_path_from_input": rel_from_input,
+                "link_host_path": str(link_abs),
+                "link_relative_path_from_workdir": rel_from_input,
+                "relative_symlink_target": target,
+            }
+        )
+    return {
+        "status": "planned",
+        "policy": "copy_config_symlink_netcdf",
+        "workdir": str(workdir),
+        "workdir_host_path": str(workdir),
+        "workdir_relative": rel_to(workdir, paths["experiment_root"]),
+        "planned_workdir_template": "runs/<run_id>/work",
+        "symlinks": symlinks,
+        "symlinked_runtime_data": legacy_symlinks,
+        "runtime_data_assets": [
+            {
+                "source_host_path": asset["absolute_path"],
+                "source_relative_path_from_input": asset["relative_from_input"],
+                "exists": Path(asset["absolute_path"]).exists(),
+                "size_bytes": asset.get("size_bytes"),
+                "content_hash": asset.get("sha256"),
+                "source": "manifest_evidence",
+                "copy_policy": "symlink_into_work",
+            }
+            for asset in runtime_assets
+        ],
+        "copied_files": [],
+        "warnings": warnings,
+        "blockers": [],
+        "docker_mounts": [],
+    }
+
+
+def dry_run_execution_plan(paths, manifest, binary_path, workdir):
+    compile_context = runtime_compile_context(paths, manifest)
+    existing_plan = runtime_execution_plan(paths["input"], compile_context)
+    profile = existing_plan.get("parallel_backend", "unknown")
+    blockers = list(existing_plan.get("blockers", []))
+    warnings = list(existing_plan.get("warnings", []))
+    status = "blocked" if blockers else "planned"
+    parsed = {
+        "NPP": compile_context.get("dimensions", {}).get("npp", "unknown"),
+        "NSUB_X": compile_context.get("dimensions", {}).get("nsub_x", "unknown"),
+        "NSUB_E": compile_context.get("dimensions", {}).get("nsub_e", "unknown"),
+        "NP_XI": compile_context.get("dimensions", {}).get("np_xi", "unknown"),
+        "NP_ETA": compile_context.get("dimensions", {}).get("np_eta", "unknown"),
+        "NNODES": compile_context.get("dimensions", {}).get("nnodes", "unknown"),
+    }
+    parsed = {key: ("unknown" if value is None else value) for key, value in parsed.items()}
+    environment = {}
+    argv = ["./croco", "croco.in"]
+    if profile == "openmp":
+        omp = existing_plan.get("openmp", {}).get("planned_omp_num_threads")
+        if omp is None:
+            omp = 1
+            warnings.append("OPENMP detected but NPP could not be parsed; planning OMP_NUM_THREADS=1.")
+        environment["OMP_NUM_THREADS"] = str(omp)
+    return {
+        "status": status,
+        "profile": profile if profile in {"serial", "openmp"} else "unsupported",
+        "binary_path": str(binary_path),
+        "working_directory": str(workdir),
+        "argv": argv,
+        "environment": environment,
+        "detected_capabilities": existing_plan.get("backend_symbols", {}),
+        "parsed_parameters": parsed,
+        "blockers": blockers,
+        "warnings": warnings,
+        "active_symbol_resolution": existing_plan.get("active_symbol_resolution", {}),
+        "effective_param_resolution": existing_plan.get("effective_param_resolution", {}),
+    }
+
+
+def write_dry_run_plan(path, plan):
+    tmp = path.with_suffix(".json.tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(plan, f, indent=2, sort_keys=True)
+        f.write("\n")
+    tmp.replace(path)
+
+
+def write_metadata_dry_run_report(path, plan):
+    materialization = plan["runtime_materialization"]
+    execution = plan["runtime_execution_plan"]
+    lines = [
+        "# Dry-Run Report",
+        "",
+        f"- Experiment: {plan['experiment_name']}",
+        f"- Dry-run status: {plan['status']}",
+        f"- Planned run ID: {plan['run_id']}",
+        f"- Planned workdir: {materialization['workdir']}",
+        f"- Binary path: {plan.get('binary_path') or 'none'}",
+        f"- Runtime data asset count: {len(plan.get('runtime_data_assets', []))}",
+        f"- Planned symlink count: {len(materialization.get('symlinks', []))}",
+        f"- Selected execution profile: {execution.get('profile')}",
+        f"- Detected capabilities: {execution.get('detected_capabilities')}",
+        f"- Parsed parameters: {execution.get('parsed_parameters')}",
+        "",
+        "## Symlink Plan",
+    ]
+    lines.extend([f"- {s['link_path']} -> {s['target_path']} (source: {s['asset_path']})" for s in materialization.get("symlinks", [])] or ["- none"])
+    lines.extend([
+        "",
+        "## Blockers",
+    ])
+    lines.extend([f"- {b.get('category', 'blocker')}: {b.get('description', b)}" for b in plan.get("blockers", [])] or ["- none"])
+    lines.extend(["", "## Warnings"])
+    lines.extend([f"- {w}" for w in plan.get("warnings", [])] or ["- none"])
+    lines.extend(
+        [
+            "",
+            "## Scope Disclaimer",
+            "",
+            "Dry-run does not launch CROCO. Dry-run records planning findings only; it does not prove scientific correctness, compile correctness, runtime semantic compatibility, or experiment well-posedness.",
+        ]
+    )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def cmd_dry_run(args):
+    try:
+        paths = experiment_paths(args)
+        manifest = load_required_manifest_for_command(paths, args.experiment_name, "dry-run")
+        compile_attempt, binary_path = load_compile_attempt(paths, manifest)
         run_id = args.run_id or generated_run_id()
         run_dir = paths["runs"] / run_id
-        reports_dir = run_dir / "reports"
-        reports_dir.mkdir(parents=True, exist_ok=True)
-        binary = binary_status(paths)
-        selected_binary = Path(binary["candidates"][0]) if binary["present"] else None
-        inventory, counts, materialization_plan, warnings, ambiguities, blockers = classify_dry_run_assets(paths, run_dir, selected_binary)
-        compile_context = runtime_compile_context(paths, manifest)
-        execution_plan = runtime_execution_plan(paths["input"], compile_context)
+        runtime_assets = planned_runtime_assets_from_manifest(manifest, paths)
+        materialization_plan = dry_run_materialization_plan(paths, run_id, runtime_assets)
+        execution_plan = dry_run_execution_plan(paths, manifest, binary_path, run_dir / "work")
+        warnings = list(manifest.get("reporting", {}).get("warnings", []))
+        warnings.extend(materialization_plan.get("warnings", []))
         warnings.extend(execution_plan.get("warnings", []))
-        blockers.extend(execution_plan.get("blockers", []))
-        findings = [binary["message"], "Dry-run is artifact-level reporting and does not prove CROCO semantic compatibility."]
-        if manifest.get("compile_time", {}).get("analytical_finding") == "present_in_input" and counts.get("runtime_data", 0):
+        if any(entry.get("path") == "input/run.env" for entry in manifest.get("evidence", {}).get("ignored_user_files", [])):
+            warnings.append("input/run.env is ignored; CROCOEXP does not source env files or substitute croco.in.")
+        blockers = list(execution_plan.get("blockers", []))
+        findings = ["Dry-run is host-side planning only and does not launch CROCO."]
+        if manifest.get("compile_time", {}).get("analytical_finding") == "present_in_input" and runtime_assets:
             manifest["reporting"].setdefault("possible_mismatches", []).append(
                 {
                     "id": "finding.analytical_with_external_data",
@@ -1864,94 +2437,61 @@ def cmd_dry_run(args):
                     "impact": "reported only; not a default blocker",
                 }
             )
-        docker_image = args.image or configured_default_image()
-        docker_mode = "host-only" if args.no_docker else "docker-backed-readiness"
-        if args.no_docker:
-            docker_ok = True
-            docker_failure_category = "none"
-            docker_message = "Docker readiness checks skipped by --no-docker."
-            docker_commands = []
-        else:
-            docker_ok, docker_failure_category, docker_message, docker_commands = docker_readiness(docker_image)
-            if not docker_ok:
-                blockers.append(
-                    {
-                        "id": "blocker.docker_backend",
-                        "category": "docker_backend",
-                        "description": docker_message,
-                        "evidence": docker_commands,
-                        "required_resolution": "Make Docker available or rerun with --no-docker for host-only reporting.",
-                    }
-                )
-        warnings.append(docker_message)
-        if not binary["present"]:
-            warnings.append(binary["message"])
-        report_path = reports_dir / "dry_run_report.md"
-        metadata_report = paths["metadata"] / "report.md"
-        failure_category = "none"
+        status = "planned"
         exit_code = 0
-        if any(b["category"] == "missing_artifact" for b in blockers):
-            failure_category = "missing_artifact"
-            exit_code = 3
-        elif any(b["category"] == "unsupported_runtime_backend" for b in blockers):
-            failure_category = "unsupported_runtime_backend"
-            exit_code = 4
-        elif blockers:
-            failure_category = "metadata_or_staging"
-            exit_code = 4
-        elif not docker_ok:
-            failure_category = docker_failure_category
-            exit_code = 7
-        status = "reported_with_warnings" if warnings or ambiguities else "reported_clean"
-        if exit_code != 0:
-            status = "blocked_missing_artifact" if failure_category == "missing_artifact" else "blocked_backend"
-        manifest["assets"]["inventory"] = inventory
-        manifest["assets"]["classification_counts"] = counts
-        manifest["assets"]["selected_mounts"] = []
+        if blockers:
+            status = "blocked"
+            exit_code = 11
+        plan_path = paths["metadata"] / "dry_run_plan.json"
+        report_path = paths["metadata"] / "dry_run_report.md"
+        legacy_report_path = run_dir / "reports" / "dry_run_report.md"
+        plan = {
+            "experiment_name": args.experiment_name,
+            "run_id": run_id,
+            "input_dir": str(paths["input"]),
+            "manifest_path": str(paths["manifest"]),
+            "compile_attempt_ref": str(paths["metadata"] / "compile_attempt.json"),
+            "compile_attempt": compile_attempt,
+            "binary_path": str(binary_path),
+            "runtime_data_assets": runtime_assets,
+            "runtime_materialization": materialization_plan,
+            "runtime_execution_plan": execution_plan,
+            "warnings": warnings,
+            "blockers": blockers,
+            "status": status,
+        }
+        write_dry_run_plan(plan_path, plan)
+        write_metadata_dry_run_report(report_path, plan)
+        if args.run_id:
+            legacy_report_path.parent.mkdir(parents=True, exist_ok=True)
+            write_metadata_dry_run_report(legacy_report_path, plan)
+        manifest.setdefault("assets", {}).setdefault("classification_counts", {})["runtime_data"] = len(runtime_assets)
+        manifest["assets"].setdefault("selected_mounts", [])
         manifest["runtime_materialization"] = materialization_plan
         manifest["runtime_execution_plan"] = execution_plan
-        manifest["compile_time"]["active_cpp_symbols"] = compile_context["active_cpp_symbols"]
-        manifest["compile_time"]["active_cpp_symbols_source"] = compile_context["active_cpp_symbols_source"]
-        manifest["compile_time"]["active_symbol_resolution"] = compile_context["active_symbol_resolution"]
-        manifest["compile_time"]["input_cppdefs_hash"] = compile_context["input_cppdefs_hash"]
-        manifest["compile_time"]["input_param_hash"] = compile_context["input_param_hash"]
-        manifest["compile_time"]["effective_preprocessor_provenance"] = compile_context["effective_preprocessor_provenance"]
-        manifest["compile_time"]["effective_preprocessor_provenance_source"] = compile_context["effective_preprocessor_provenance_source"]
-        manifest["compile_time"]["dimensions"] = compile_context["dimensions"]
-        manifest["compile_time"]["effective_param_source"] = compile_context["effective_param_source"]
-        manifest["compile_time"]["effective_param_resolution"] = compile_context["effective_param_resolution"]
+        manifest["dry_run"] = {"last_attempt": plan}
         manifest["reporting"].update(
             {
-                "status": status,
+                "status": "reported_with_warnings" if warnings else "reported_clean",
                 "last_reported_at": utc_now(),
                 "warnings": warnings,
-                "ambiguities": ambiguities,
                 "infrastructural_blockers": blockers,
-                "backend_outcome": {"mode": docker_mode, "ok": docker_ok, "message": docker_message},
+                "dry_run_outcome": {"status": status, "exit_code": exit_code, "plan": str(plan_path), "report": str(report_path)},
             }
         )
-        manifest["docker_backend"]["image"] = docker_image
-        manifest["docker_backend"]["mounts"] = materialization_plan["docker_mounts"]
-        manifest["docker_backend"]["working_directory"] = materialization_plan["workdir_container_path"]
-        snapshot_record = snapshot_dry_run(paths, manifest, run_dir, inventory, materialization_plan)
-        manifest.setdefault("snapshots", {}).setdefault("snapshot_records", []).append(snapshot_record)
-        manifest["snapshots"]["latest_dry_run_snapshot"] = snapshot_record
-        write_dry_run_report(report_path, manifest, run_id, docker_image, docker_mode, binary, counts, inventory, materialization_plan, execution_plan, warnings, findings, blockers, failure_category)
-        write_metadata_report(manifest, metadata_report)
         append_command(
             manifest,
             "dry-run",
             [args.experiment_name],
             inputs_used=[f"input/{name}" for name in PRIMARY_ARTIFACTS],
             staging_decisions=[],
-            mappings=materialization_plan["docker_mounts"],
+            mappings=materialization_plan["symlinks"],
             logs=[],
-            reports=[str(report_path), str(metadata_report)],
+            reports=[str(plan_path), str(report_path)] + ([str(legacy_report_path)] if args.run_id else []),
             warnings=warnings,
             findings=findings,
-            failure_category=failure_category,
+            failure_category="none" if exit_code == 0 else "unsupported_runtime_backend",
             exit_code=exit_code,
-            docker_image=docker_image,
             source_ref=manifest.get("compile_time", {}).get("source_ref"),
         )
         write_manifest(manifest, paths["manifest"])
@@ -1960,10 +2500,10 @@ def cmd_dry_run(args):
             {
                 "run_id": run_id,
                 "dry_run_report": str(report_path),
-                "snapshot": str(run_dir / "snapshots"),
-                "mode": docker_mode,
-                "binary_present": binary["present"],
-                "failure_category": failure_category,
+                "dry_run_plan": str(plan_path),
+                "binary_path": str(binary_path),
+                "status": status,
+                "failure_category": "none" if exit_code == 0 else "unsupported_runtime_backend",
             }
         )
         print_or_json(summary, args.json)
@@ -2200,19 +2740,33 @@ def cmd_run(args):
 
 
 def cmd_compile(args):
-    paths = experiment_paths(args)
     try:
+        paths = experiment_paths(args)
+        if not paths["experiment_root"].is_dir():
+            raise CrocoexpError(f"missing experiment directory: {paths['experiment_root']}", 6, "missing_experiment_input")
+        if not paths["input"].is_dir():
+            raise CrocoexpError(f"missing input directory: {paths['input']}", 6, "missing_experiment_input")
         if not paths["manifest"].exists():
             raise CrocoexpError(
                 f"missing manifest: {paths['manifest']}; run 'crocoexp import {args.experiment_name}' first",
-                4,
-                "metadata_or_staging",
+                3,
+                "missing_manifest",
             )
         ensure_importable(paths)
-        manifest = load_manifest(paths["manifest"])
+        try:
+            manifest = load_manifest(paths["manifest"])
+        except json.JSONDecodeError as e:
+            raise CrocoexpError(f"malformed manifest JSON: {paths['manifest']}: {e}", 3, "malformed_manifest")
+        except OSError as e:
+            raise CrocoexpError(f"unable to read manifest: {paths['manifest']}: {e}", 3, "unreadable_manifest")
+
         source_ref = resolve_compile_source(args, manifest)
         manifest["compile_time"]["source_ref"] = source_ref
         stage, logs, output, staged = stage_compile_inputs(paths)
+        staged_source = copy_compile_source_to_stage(source_ref, stage)
+        staged.append({"source": source_ref["host_path"], "destination": str(staged_source), "reason": "registered_source_tree_copy"})
+        entrypoints = detect_compile_entrypoints(staged_source)
+
         compile_context = effective_compile_context(paths, logs, include_paths=source_include_paths_from_manifest(manifest))
         manifest["compile_time"]["active_cpp_symbols"] = compile_context["active_cpp_symbols"]
         manifest["compile_time"]["active_cpp_symbols_source"] = compile_context["active_cpp_symbols_source"]
@@ -2225,10 +2779,13 @@ def cmd_compile(args):
         manifest["compile_time"]["effective_param_source"] = compile_context["effective_param_source"]
         manifest["compile_time"]["effective_param_resolution"] = compile_context["effective_param_resolution"]
         manifest["runtime_execution_plan"] = runtime_execution_plan(paths, compile_context)
+
         script = write_compile_script(paths, stage, output, source_ref)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_path = logs / f"compile_{args.experiment_name}_{ts}.log"
         report_path = paths["metadata"] / "compile_report.md"
+        attempt_path = paths["metadata"] / "compile_attempt.json"
+        stdout_path = paths["build"] / "compile_stdout.log"
+        stderr_path = paths["build"] / "compile_stderr.log"
+        legacy_log_path = logs / f"compile_{args.experiment_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
         docker_image = args.image or configured_default_image()
         docker_mounts = [
             {
@@ -2286,26 +2843,74 @@ def cmd_compile(args):
             "Compile is an attempted Docker-backed build; runtime semantic findings do not block it by default.",
             f"Registered compile source selected: {source_ref['source_id']}",
         ]
+        warnings = list(manifest.get("reporting", {}).get("warnings", []))
         manifest["compile_time"]["staged_inputs"] = staged
         manifest["docker_backend"]["image"] = docker_image
         manifest["docker_backend"]["working_directory"] = container_path(stage, paths["experiments_root"])
         manifest["docker_backend"]["compile_command_summary"] = " ".join(docker_cmd)
         manifest["docker_backend"]["mounts"] = docker_mounts
+
         failure_category = "none"
         exit_code = 0
-        try:
-            with log_path.open("w", encoding="utf-8") as log:
-                proc = subprocess.run(docker_cmd, stdout=log, stderr=subprocess.STDOUT, text=True)
-            if proc.returncode == 125 or proc.returncode == 126 or proc.returncode == 127:
+        proc_returncode = None
+        if not entrypoints:
+            failure_category = "missing_compile_entrypoint"
+            exit_code = 9
+            warnings.append("No supported compile entrypoint found in registered source tree copy.")
+            stdout_path.write_text("", encoding="utf-8")
+            stderr_path.write_text("ERROR: no supported compile entrypoint found in registered source tree.\n", encoding="utf-8")
+        else:
+            docker_path = shutil.which("docker")
+            if docker_path is None:
+                stdout_path.write_text("", encoding="utf-8")
+                stderr_path.write_text("ERROR: docker executable not found on host PATH.\n", encoding="utf-8")
                 failure_category = "docker_backend"
                 exit_code = 7
-            elif proc.returncode != 0:
-                failure_category = "compile_failure"
-                exit_code = 8
-        except FileNotFoundError:
-            log_path.write_text("ERROR: docker executable not found on host PATH.\n", encoding="utf-8")
-            failure_category = "docker_backend"
-            exit_code = 7
+            else:
+                info_proc = run_docker_command(["docker", "info"])
+                if info_proc.returncode != 0:
+                    stdout_path.write_text(info_proc.stdout or "", encoding="utf-8")
+                    stderr_path.write_text(info_proc.stderr or "ERROR: Docker daemon unavailable.\n", encoding="utf-8")
+                    failure_category = "docker_backend"
+                    exit_code = 7
+                else:
+                    proc = subprocess.run(docker_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    proc_returncode = proc.returncode
+                    stdout_path.write_text(proc.stdout or "", encoding="utf-8")
+                    stderr_path.write_text(proc.stderr or "", encoding="utf-8")
+                    if proc.returncode in {125, 126, 127}:
+                        failure_category = "docker_backend"
+                        exit_code = 7
+                    elif proc.returncode != 0:
+                        failure_category = "compile_failure"
+                        exit_code = 8
+
+        legacy_log_path.write_text(
+            (stdout_path.read_text(encoding="utf-8", errors="replace") if stdout_path.exists() else "")
+            + (stderr_path.read_text(encoding="utf-8", errors="replace") if stderr_path.exists() else ""),
+            encoding="utf-8",
+        )
+        binary = find_compile_binary(paths) if exit_code == 0 else None
+        attempt = {
+            "attempted_at": utc_now(),
+            "status": "success" if exit_code == 0 else "failed",
+            "failure_category": failure_category,
+            "source_id": source_ref["source_id"],
+            "source_installed_path": source_ref.get("installed_path") or source_ref["host_path"],
+            "stage_dir": str(stage),
+            "docker_image": docker_image,
+            "docker_command": docker_cmd if entrypoints else [],
+            "returncode": proc_returncode if proc_returncode is not None else exit_code,
+            "warnings": warnings,
+            "logs": {"stdout_path": str(stdout_path), "stderr_path": str(stderr_path)},
+            "binary": binary,
+            "staged_inputs": staged,
+            "compile_entrypoints": entrypoints,
+        }
+        write_compile_attempt(attempt_path, attempt)
+        if binary:
+            manifest.setdefault("build", {})["binary"] = binary
+        manifest["compile"] = {"last_attempt": attempt}
         append_command(
             manifest,
             "compile",
@@ -2313,20 +2918,38 @@ def cmd_compile(args):
             inputs_used=[source_ref["host_path"]] + [s["source"] for s in staged],
             staging_decisions=staged + [{"source": str(script), "destination": str(script), "reason": "generated_compile_wrapper"}],
             mappings=docker_mounts,
-            logs=[str(log_path)],
-            reports=[str(report_path)],
-            warnings=manifest.get("reporting", {}).get("warnings", []),
+            logs=[str(stdout_path), str(stderr_path), str(legacy_log_path)],
+            reports=[str(report_path), str(attempt_path)],
+            warnings=warnings,
             findings=findings,
             failure_category=failure_category,
             exit_code=exit_code,
             docker_image=docker_image,
             source_ref=source_ref,
         )
-        manifest["reporting"]["compile_outcome"] = {"failure_category": failure_category, "exit_code": exit_code, "log": str(log_path)}
-        write_compile_report(manifest, report_path, log_path, failure_category, exit_code)
+        manifest["reporting"]["compile_outcome"] = {
+            "failure_category": failure_category,
+            "exit_code": exit_code,
+            "log": str(legacy_log_path),
+            "stdout_log": str(stdout_path),
+            "stderr_log": str(stderr_path),
+            "attempt": str(attempt_path),
+        }
+        write_compile_report(manifest, report_path, legacy_log_path, failure_category, exit_code, attempt)
         write_manifest(manifest, paths["manifest"])
         summary = manifest_summary(manifest)
-        summary.update({"compile_report": str(report_path), "compile_log": str(log_path), "failure_category": failure_category})
+        summary.update(
+            {
+                "compile_report": str(report_path),
+                "compile_attempt": str(attempt_path),
+                "compile_stdout": str(stdout_path),
+                "compile_stderr": str(stderr_path),
+                "compile_log": str(legacy_log_path),
+                "failure_category": failure_category,
+                "docker_image": docker_image,
+                "source_id": source_ref["source_id"],
+            }
+        )
         print_or_json(summary, args.json)
         return exit_code
     except CrocoexpError as e:
