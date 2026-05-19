@@ -253,21 +253,23 @@ The selected compile source is recorded under:
 
 Reports are written for human inspection, including import, compile, dry-run, run, and setup reports. Snapshots copy effective config/code artifacts where appropriate and record references, hashes, sizes, and mappings for runtime data assets.
 
-## Minimal Getting Started
+## v1.0.0 Workflow
 
 ```bash
-./crocoexp setup --no-pull
-./crocoexp source install /path/to/croco-source --id croco-v2.1.2 --flavor croco --version v2.1.2
+./crocoexp setup --image domarcroco/images-for-croco:base_croco_msot-1.0.0 --pull
+./crocoexp source install /path/to/croco/source --id croco-msot-local
 
-mkdir -p CROCO_EXPERIMENTS/my_experiment/input
+mkdir -p CROCO_EXPERIMENTS/minimal/input
 # Add croco.in, cppdefs.h, param.h, optional analytical.F, and any runtime data to input/
 
-./crocoexp import my_experiment --source croco-v2.1.2
-./crocoexp inspect my_experiment
-./crocoexp compile my_experiment
-./crocoexp dry-run my_experiment
-./crocoexp run my_experiment
+./crocoexp import minimal --source croco-msot-local
+./crocoexp inspect minimal
+./crocoexp compile minimal
+./crocoexp dry-run minimal
+./crocoexp run minimal --run-id test-run-001
 ```
+
+Normal use is host-side; Docker is backend only. `input/` is canonical evidence and is not modified by the workflow. Runtime data assets stay in `input/`, and `run` exposes them through relative symlinks in the run-local `work/` directory. v1.0.0 supports serial and tested OpenMP execution only; MPI, OPENACC, XIOS, OASIS, and AGRIF execution are out of scope unless explicitly implemented and tested. CROCOEXP guarantees reproducible orchestration records, not scientific validity.
 
 ## MesaRotante Pattern
 

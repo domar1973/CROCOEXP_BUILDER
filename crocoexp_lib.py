@@ -565,7 +565,7 @@ def runtime_execution_plan(paths_or_input_dir, compile_context=None):
 
     openmp_enabled = backend["openmp"]
     mpi_enabled = backend["mpi"]
-    special = [name for name in ("openacc", "xios", "oasis") if backend[name]]
+    special = [name for name in ("openacc", "xios", "oasis", "agrif") if backend[name]]
     low_confidence = context.get("confidence") not in {"effective_preprocessor", "successful_compile_evidence"}
     if special and not low_confidence:
         for name in special:

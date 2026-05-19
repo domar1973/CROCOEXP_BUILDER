@@ -189,6 +189,15 @@ exit 1
         result = self.run_cli(["--experiments-root", str(root), "dry-run", name, "--run-id", run_id], env=env)
         return result, attempt
 
+    def input_hashes(self, root, name="EXP_A"):
+        input_dir = root / name / "input"
+        hashes = {}
+        for path in sorted(p for p in input_dir.rglob("*") if p.is_file() and not p.is_symlink()):
+            hashes[str(path.relative_to(input_dir))] = path.read_bytes()
+        for path in sorted(p for p in input_dir.rglob("*") if p.is_symlink()):
+            hashes[str(path.relative_to(input_dir))] = f"symlink:{os.readlink(path)}".encode("utf-8")
+        return hashes
+
     def write_cppdefs_param(self, root, name="EXP_A", cppdefs="", param=""):
         input_dir = root / name / "input"
         (input_dir / "cppdefs.h").write_text(cppdefs or "#define TEST\n", encoding="utf-8")
@@ -1521,6 +1530,187 @@ exit 1
             self.assertEqual(result.returncode, 13)
             manifest = json.loads((root / "EXP_A" / "metadata" / "manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["reporting"]["run_outcome"]["failure_category"], "run_failure")
+
+    def test_acceptance_full_mocked_workflow_traceability(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "CROCO_EXPERIMENTS"
+            env = self.fake_docker_env(tmp, present=False)
+            env["FAKE_DOCKER_RUN_CODE"] = "0"
+            self.make_exp(root, name="minimal", data=True)
+            setup = self.run_cli(
+                [
+                    "--experiments-root",
+                    str(root),
+                    "setup",
+                    "--image",
+                    "domarcroco/images-for-croco:base_croco_msot-1.0.0",
+                    "--pull",
+                ],
+                env=env,
+            )
+            self.assertEqual(setup.returncode, 0, setup.stderr)
+            repo = Path(env["CROCOEXP_REPO_ROOT"])
+            self.assertTrue((repo / ".crocoexp" / "config.json").is_file())
+            self.assertTrue((repo / ".crocoexp" / "setup_report.md").is_file())
+            self.assertFalse((repo / ".crocoexp" / "sources.json").exists())
+
+            self.install_source(tmp, root, source_id="croco-msot-local", env=env)
+            self.assertTrue((repo / ".crocoexp" / "sources.json").is_file())
+            self.assertTrue((root / "sources" / "croco-msot-local").is_dir())
+
+            imported = self.run_cli(["--experiments-root", str(root), "import", "minimal", "--source", "croco-msot-local"], env=env)
+            self.assertEqual(imported.returncode, 0, imported.stderr)
+            inspected = self.run_cli(["--experiments-root", str(root), "inspect", "minimal"], env=env)
+            self.assertEqual(inspected.returncode, 0, inspected.stderr)
+            env["FAKE_DOCKER_WORK_OUTPUT"] = "croco"
+            compiled = self.run_cli(["--experiments-root", str(root), "compile", "minimal"], env=env)
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            env.pop("FAKE_DOCKER_WORK_OUTPUT")
+            dry = self.run_cli(["--experiments-root", str(root), "dry-run", "minimal"], env=env)
+            self.assertEqual(dry.returncode, 0, dry.stderr)
+            env["FAKE_DOCKER_WORK_OUTPUT"] = "HIS/history.nc"
+            ran = self.run_cli(["--experiments-root", str(root), "run", "minimal", "--run-id", "test-run-001"], env=env)
+            self.assertEqual(ran.returncode, 0, ran.stderr)
+
+            exp = root / "minimal"
+            expected = [
+                root / "sources" / "croco-msot-local",
+                exp / "input",
+                exp / "metadata" / "manifest.json",
+                exp / "metadata" / "report.md",
+                exp / "metadata" / "compile_attempt.json",
+                exp / "metadata" / "compile_report.md",
+                exp / "metadata" / "dry_run_plan.json",
+                exp / "metadata" / "dry_run_report.md",
+                exp / "runs" / "test-run-001" / "work",
+                exp / "runs" / "test-run-001" / "output",
+                exp / "runs" / "test-run-001" / "logs",
+                exp / "runs" / "test-run-001" / "snapshots",
+                exp / "runs" / "test-run-001" / "reports" / "run_attempt.json",
+                exp / "runs" / "test-run-001" / "reports" / "run_report.md",
+            ]
+            for path in expected:
+                self.assertTrue(path.exists(), str(path))
+            manifest = json.loads((exp / "metadata" / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["compile_time"]["source_ref"]["source_id"], "croco-msot-local")
+            self.assertEqual(manifest["compile"]["last_attempt"]["source_id"], "croco-msot-local")
+            self.assertEqual(manifest["runs"]["last_run_id"], "test-run-001")
+            self.assertFalse((exp / "input" / "croco-msot-local").exists())
+
+    def test_acceptance_input_immutable_across_import_inspect_compile_dry_run_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "CROCO_EXPERIMENTS"
+            env = self.fake_docker_env(tmp, present=True)
+            env["FAKE_DOCKER_RUN_CODE"] = "0"
+            self.make_exp(root, name="minimal", data=True)
+            (root / "minimal" / "input" / "run.env").write_text("SHOULD_NOT_BE_USED=changed.nc\n", encoding="utf-8")
+            self.install_source(tmp, root, source_id="immutable-source", env=env)
+            before = self.input_hashes(root, "minimal")
+            self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "minimal", "--source", "immutable-source"], env=env).returncode, 0)
+            self.assertEqual(self.input_hashes(root, "minimal"), before)
+            self.assertEqual(self.run_cli(["--experiments-root", str(root), "inspect", "minimal"], env=env).returncode, 0)
+            self.assertEqual(self.input_hashes(root, "minimal"), before)
+            env["FAKE_DOCKER_WORK_OUTPUT"] = "croco"
+            self.assertEqual(self.run_cli(["--experiments-root", str(root), "compile", "minimal"], env=env).returncode, 0)
+            self.assertEqual(self.input_hashes(root, "minimal"), before)
+            env.pop("FAKE_DOCKER_WORK_OUTPUT")
+            self.assertEqual(self.run_cli(["--experiments-root", str(root), "dry-run", "minimal", "--run-id", "IMMUTABLE"], env=env).returncode, 0)
+            self.assertEqual(self.input_hashes(root, "minimal"), before)
+            env["FAKE_DOCKER_WORK_OUTPUT"] = "ocean_his.nc"
+            self.assertEqual(self.run_cli(["--experiments-root", str(root), "run", "minimal", "--run-id", "IMMUTABLE"], env=env).returncode, 0)
+            self.assertEqual(self.input_hashes(root, "minimal"), before)
+            attempt = json.loads((root / "minimal" / "runs" / "IMMUTABLE" / "reports" / "run_attempt.json").read_text(encoding="utf-8"))
+            self.assertNotIn("changed.nc", json.dumps(attempt))
+
+    def test_acceptance_runtime_data_extensions_stay_canonical_and_symlinked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "CROCO_EXPERIMENTS"
+            env = self.fake_docker_env(tmp, present=True)
+            env["FAKE_DOCKER_RUN_CODE"] = "0"
+            exp = self.make_exp(root, data=False, croco_text="TITLE == test\nFRCNAME == missing_from_croco_in.nc\n")
+            for name in ("grid.nc", "history.nc4", "restart.cdf", "clim.netcdf"):
+                (exp / "input" / name).write_bytes(name.encode("utf-8"))
+            self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A"], env=env).returncode, 0)
+            dry, _ = self.prepare_dry_run_plan(root, run_id="DATAEXT", env=env)
+            self.assertEqual(dry.returncode, 0, dry.stderr)
+            plan = json.loads((root / "EXP_A" / "metadata" / "dry_run_plan.json").read_text(encoding="utf-8"))
+            self.assertEqual({s["asset_path"] for s in plan["runtime_materialization"]["symlinks"]}, {f"input/{n}" for n in ("grid.nc", "history.nc4", "restart.cdf", "clim.netcdf")})
+            self.assertNotIn("missing_from_croco_in.nc", json.dumps(plan))
+            ran = self.run_cli(["--experiments-root", str(root), "run", "EXP_A", "--run-id", "DATAEXT"], env=env)
+            self.assertEqual(ran.returncode, 0, ran.stderr)
+            work = root / "EXP_A" / "runs" / "DATAEXT" / "work"
+            for name in ("grid.nc", "history.nc4", "restart.cdf", "clim.netcdf"):
+                link = work / name
+                self.assertTrue(link.is_symlink(), name)
+                self.assertFalse(os.readlink(link).startswith("/"), name)
+                self.assertEqual(link.resolve(), root / "EXP_A" / "input" / name)
+            self.assertFalse((root / "EXP_A" / "runs" / "DATAEXT" / "snapshots" / "grid.nc").exists())
+            self.assertFalse((root / "EXP_A" / "runs" / "DATAEXT" / "output" / "grid.nc").exists())
+
+    def test_acceptance_run_uses_dry_run_plan_not_fresh_croco_in_parsing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "CROCO_EXPERIMENTS"
+            env = self.fake_docker_env(tmp, present=True)
+            env["FAKE_DOCKER_RUN_CODE"] = "0"
+            exp = self.make_exp(root, data=False, croco_text="TITLE == test\nGRDNAME == missing_grid_from_text.nc\n")
+            (exp / "input" / "actual.nc").write_bytes(b"actual")
+            self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A"], env=env).returncode, 0)
+            dry, _ = self.prepare_dry_run_plan(root, run_id="PLANONLY", env=env)
+            self.assertEqual(dry.returncode, 0, dry.stderr)
+            (exp / "input" / "croco.in").write_text("TITLE == changed\nGRDNAME == late.nc\n", encoding="utf-8")
+            (exp / "input" / "late.nc").write_bytes(b"late")
+            ran = self.run_cli(["--experiments-root", str(root), "run", "EXP_A", "--run-id", "PLANONLY"], env=env)
+            self.assertEqual(ran.returncode, 0, ran.stderr)
+            work = root / "EXP_A" / "runs" / "PLANONLY" / "work"
+            self.assertTrue((work / "actual.nc").is_symlink())
+            self.assertFalse((work / "late.nc").exists())
+            self.assertNotIn("missing_grid_from_text.nc", json.dumps(json.loads((work.parent / "reports" / "run_attempt.json").read_text(encoding="utf-8"))))
+
+    def test_acceptance_unsupported_profiles_block_dry_run_and_run_without_docker_run(self):
+        for symbol in ("MPI", "OPENACC", "XIOS", "OASIS", "AGRIF"):
+            with self.subTest(symbol=symbol):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp) / "CROCO_EXPERIMENTS"
+                    env = self.fake_docker_env(tmp, present=True)
+                    env["FAKE_DOCKER_RUN_CODE"] = "0"
+                    self.make_exp(root, data=True)
+                    self.write_cppdefs_param(root, cppdefs=f"#define {symbol}\n", param="parameter (NPP=1)\n")
+                    self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A"], env=env).returncode, 0)
+                    dry, _ = self.prepare_dry_run_plan(root, run_id=f"BLOCK_{symbol}", env=env)
+                    self.assertEqual(dry.returncode, 11, dry.stderr)
+                    ran = self.run_cli(["--experiments-root", str(root), "run", "EXP_A", "--run-id", f"BLOCK_{symbol}"], env=env)
+                    self.assertEqual(ran.returncode, 11, ran.stderr)
+                    run_dir = root / "EXP_A" / "runs" / f"BLOCK_{symbol}"
+                    self.assertFalse((run_dir / "work" / "run_inside_docker.sh").exists())
+                    self.assertFalse((run_dir / "logs" / "run_stdout.log").exists())
+
+    def test_acceptance_reports_include_non_validation_disclaimers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "CROCO_EXPERIMENTS"
+            env = self.fake_docker_env(tmp, present=True)
+            env["FAKE_DOCKER_RUN_CODE"] = "0"
+            self.make_exp(root, data=True)
+            self.install_source(tmp, root, source_id="report-source", env=env)
+            self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A", "--source", "report-source"], env=env).returncode, 0)
+            inspect = self.run_cli(["--experiments-root", str(root), "inspect", "EXP_A"], env=env)
+            self.assertEqual(inspect.returncode, 0, inspect.stderr)
+            env["FAKE_DOCKER_WORK_OUTPUT"] = "croco"
+            self.assertEqual(self.run_cli(["--experiments-root", str(root), "compile", "EXP_A"], env=env).returncode, 0)
+            env.pop("FAKE_DOCKER_WORK_OUTPUT")
+            self.assertEqual(self.run_cli(["--experiments-root", str(root), "dry-run", "EXP_A", "--run-id", "REPORTS"], env=env).returncode, 0)
+            self.assertEqual(self.run_cli(["--experiments-root", str(root), "run", "EXP_A", "--run-id", "REPORTS"], env=env).returncode, 0)
+            exp = root / "EXP_A"
+            texts = [
+                (exp / "metadata" / "report.md").read_text(encoding="utf-8"),
+                inspect.stdout,
+                (exp / "metadata" / "compile_report.md").read_text(encoding="utf-8"),
+                (exp / "metadata" / "dry_run_report.md").read_text(encoding="utf-8"),
+                (exp / "runs" / "REPORTS" / "reports" / "run_report.md").read_text(encoding="utf-8"),
+            ]
+            for text in texts:
+                self.assertIn("does not prove scientific correctness", text)
+                self.assertIn("runtime semantic compatibility", text)
+                self.assertIn("experiment well-posedness", text)
 
 
 if __name__ == "__main__":
