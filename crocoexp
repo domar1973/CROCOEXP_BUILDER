@@ -8,9 +8,17 @@ from crocoexp_lib import cmd_compile, cmd_dry_run, cmd_import, cmd_inspect, cmd_
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="crocoexp",
-        description="Host-side CROCO experiment builder commands.",
+        description="Host-side CROCOEXP v1.0.0 commands. Docker is used only as an execution backend.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""v1.0.0 command surface:
+        epilog="""Core v1.0.0 contract:
+  normal use is host-side; do not enter Docker manually
+  input/ is canonical user evidence and is not modified
+  croco.in is recorded as CROCO syntax, not parsed as universal truth
+  run.env is unsupported and ignored
+  serial and tested OpenMP execution are supported
+  MPI, OPENACC, XIOS, OASIS, and AGRIF execution are out of scope
+
+v1.0.0 command surface:
   setup
   source install
   source list
@@ -28,7 +36,12 @@ def build_parser():
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    setup_p = sub.add_parser("setup", help="Prepare repo-level Docker backend readiness.")
+    setup_p = sub.add_parser(
+        "setup",
+        help="Prepare repo-level Docker backend readiness.",
+        description="Check and record repo-level Docker backend readiness. This does not select a CROCO source, source version, or experiment.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     setup_p.add_argument("--image", help="Docker image to register as the repo default.")
     pull_group = setup_p.add_mutually_exclusive_group()
     pull_group.add_argument("--pull", action="store_true", help="Pull the selected image if missing.")
@@ -37,9 +50,19 @@ def build_parser():
     setup_p.add_argument("--force", action="store_true", help="Overwrite existing setup state cleanly.")
     setup_p.add_argument("--json", action="store_true", help="Print machine-readable summary.")
 
-    source_p = sub.add_parser("source", help="Manage registered compile sources.")
+    source_p = sub.add_parser(
+        "source",
+        help="Manage registered compile sources.",
+        description="Manage repo-level compile source registry state. Registered trees live under CROCO_EXPERIMENTS/sources/<source_id>/ and metadata lives in .crocoexp/sources.json.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     source_sub = source_p.add_subparsers(dest="source_command", required=True)
-    source_install_p = source_sub.add_parser("install", help="Copy and register a compile source tree.")
+    source_install_p = source_sub.add_parser(
+        "install",
+        help="Copy and register a compile source tree.",
+        description="Copy a host-side CROCO/MSOT/custom source tree into the repo-level source registry. This does not modify experiments or input/.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     source_install_p.add_argument("path", help="Host path to the source tree to install.")
     source_install_p.add_argument("--id", required=True, dest="source_id", help="Registered source id.")
     source_install_p.add_argument("--flavor", choices=("croco", "msot", "custom"), default="custom", help="Source flavor for traceability.")
@@ -48,23 +71,48 @@ def build_parser():
     source_install_p.add_argument("--force", action="store_true", help="Replace an existing registered source with the same id.")
     source_install_p.add_argument("--json", action="store_true", help="Print machine-readable summary.")
 
-    source_list_p = source_sub.add_parser("list", help="List registered compile sources.")
+    source_list_p = source_sub.add_parser(
+        "list",
+        help="List registered compile sources.",
+        description="List repo-level registered compile source trees from .crocoexp/sources.json.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     source_list_p.add_argument("--json", action="store_true", help="Print machine-readable summary.")
 
-    source_inspect_p = source_sub.add_parser("inspect", help="Inspect one registered compile source.")
+    source_inspect_p = source_sub.add_parser(
+        "inspect",
+        help="Inspect one registered compile source.",
+        description="Inspect one repo-level registered compile source without invoking Docker or modifying experiments.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     source_inspect_p.add_argument("source_id")
     source_inspect_p.add_argument("--json", action="store_true", help="Print machine-readable summary.")
 
-    import_p = sub.add_parser("import", help="Register and analyze an experiment input/ folder.")
+    import_p = sub.add_parser(
+        "import",
+        help="Register and analyze an experiment input/ folder.",
+        description="Inspect an existing CROCO_EXPERIMENTS/<experiment>/input/ folder and write generated metadata outside input/. Optional --source records a per-experiment source_ref.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     import_p.add_argument("experiment_name")
     import_p.add_argument("--source", dest="source_id", help="Registered compile source id for this experiment.")
     import_p.add_argument("--json", action="store_true", help="Print machine-readable summary.")
 
-    inspect_p = sub.add_parser("inspect", help="Show manifest summary.")
+    inspect_p = sub.add_parser(
+        "inspect",
+        help="Show manifest summary.",
+        description="Read metadata/manifest.json and print a read-only summary. Inspect does not create, rewrite, compile, dry-run, run, or modify input/.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     inspect_p.add_argument("experiment_name")
     inspect_p.add_argument("--json", action="store_true", help="Print machine-readable summary.")
 
-    compile_p = sub.add_parser("compile", help="Attempt CROCO compilation through Docker.")
+    compile_p = sub.add_parser(
+        "compile",
+        help="Attempt CROCO compilation through Docker.",
+        description="Record a Docker-backed build attempt using the experiment compile_time.source_ref. Build staging, logs, reports, and outputs stay outside input/.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     compile_p.add_argument("experiment_name")
     compile_p.add_argument(
         "--image",
@@ -74,18 +122,28 @@ def build_parser():
     compile_p.add_argument("--jobs", default="1", help="Compilation parallelism passed to jobcomp.")
     compile_p.add_argument("--json", action="store_true", help="Print machine-readable summary.")
 
-    dry_run_p = sub.add_parser("dry-run", help="Produce a traceable pre-execution report.")
+    dry_run_p = sub.add_parser(
+        "dry-run",
+        help="Plan runtime materialization and execution without launching CROCO.",
+        description="Plan runtime materialization and execution from import and compile metadata. Dry-run does not invoke Docker, compile CROCO, launch CROCO, modify input/, or source run.env.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     dry_run_p.add_argument("experiment_name")
     dry_run_p.add_argument("--run-id", help="Run id used for report and snapshot paths.")
-    dry_run_p.add_argument("--image", help="Docker image used for backend readiness checks.")
-    dry_run_p.add_argument("--no-docker", action="store_true", help="Skip Docker-backed readiness checks.")
+    dry_run_p.add_argument("--image", help=argparse.SUPPRESS)
+    dry_run_p.add_argument("--no-docker", action="store_true", help=argparse.SUPPRESS)
     dry_run_p.add_argument("--json", action="store_true", help="Print machine-readable summary.")
 
-    run_p = sub.add_parser("run", help="Attempt CROCO execution through Docker.")
+    run_p = sub.add_parser(
+        "run",
+        help="Execute a planned run through Docker and record the attempt.",
+        description="Consume metadata/dry_run_plan.json, materialize a run-local workdir with relative symlinks to input/ runtime data, execute only supported serial/OpenMP profiles through Docker, and record logs, snapshots, outputs, and reports.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     run_p.add_argument("experiment_name")
     run_p.add_argument("--run-id", help="Run id used for logs, output, reports, and snapshots.")
-    run_p.add_argument("--image", help="Docker image used for execution.")
-    run_p.add_argument("--require-dry-run", action="store_true", help="Require an existing dry-run report for this run id.")
+    run_p.add_argument("--image", help=argparse.SUPPRESS)
+    run_p.add_argument("--require-dry-run", action="store_true", help=argparse.SUPPRESS)
     run_p.add_argument("--json", action="store_true", help="Print machine-readable summary.")
 
     return parser

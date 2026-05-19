@@ -20,7 +20,7 @@ The builder is infrastructure-oriented and traceability-oriented. It does not pr
 
 ## Repository Commands
 
-Development note: this repository is implementing v1.0.0 in small slices. The current implemented slices lock the CLI surface, implement repo-level `setup` for Docker backend readiness, implement the repo-level source registry commands, and import existing experiment input trees into generated metadata.
+Development note: this repository is readying the v1.0.0 command surface for tagging. The implemented slices cover setup, source registry, import, inspect, compile, dry-run, run, and acceptance-level workflow coverage.
 
 Check and record Docker backend readiness:
 
@@ -117,7 +117,7 @@ Attempt a CROCO run through Docker:
 
 `run` consumes `metadata/dry_run_plan.json`, materializes a run-local workdir under `runs/<run_id>/work/`, exposes runtime data assets using relative symlinks back to `input/`, and launches CROCO through Docker as a backend. It does not compile CROCO. It records logs, snapshots, output inventory, `runs/<run_id>/reports/run_attempt.json`, and `runs/<run_id>/reports/run_report.md`.
 
-Run success records an execution attempt only. It does not prove scientific correctness, runtime semantic compatibility, or experiment well-posedness. MPI, XIOS, OASIS, AGRIF, and other specialized execution profiles remain out of scope for v1.0.0 unless explicitly implemented and tested.
+Run success records an execution attempt only. It does not prove scientific correctness, runtime semantic compatibility, or experiment well-posedness. MPI, OPENACC, XIOS, OASIS, AGRIF, and other specialized execution profiles remain out of scope for v1.0.0 unless explicitly implemented and tested.
 
 ## Directory Layout
 
@@ -215,6 +215,7 @@ Detected but unsupported launch profiles in v1:
 - OpenACC
 - XIOS
 - OASIS
+- AGRIF
 
 When one of these exact active symbols requires a specialized runtime profile, CROCOEXP blocks before launching Docker with an infrastructural runtime-backend diagnostic.
 
@@ -258,10 +259,6 @@ Reports are written for human inspection, including import, compile, dry-run, ru
 ```bash
 ./crocoexp setup --image domarcroco/images-for-croco:base_croco_msot-1.0.0 --pull
 ./crocoexp source install /path/to/croco/source --id croco-msot-local
-
-mkdir -p CROCO_EXPERIMENTS/minimal/input
-# Add croco.in, cppdefs.h, param.h, optional analytical.F, and any runtime data to input/
-
 ./crocoexp import minimal --source croco-msot-local
 ./crocoexp inspect minimal
 ./crocoexp compile minimal
@@ -269,7 +266,11 @@ mkdir -p CROCO_EXPERIMENTS/minimal/input
 ./crocoexp run minimal --run-id test-run-001
 ```
 
+Before `import`, create `CROCO_EXPERIMENTS/minimal/input/` and place `croco.in`, `cppdefs.h`, `param.h`, optional `analytical.F`, and runtime data assets there.
+
 Normal use is host-side; Docker is backend only. `input/` is canonical evidence and is not modified by the workflow. Runtime data assets stay in `input/`, and `run` exposes them through relative symlinks in the run-local `work/` directory. v1.0.0 supports serial and tested OpenMP execution only; MPI, OPENACC, XIOS, OASIS, and AGRIF execution are out of scope unless explicitly implemented and tested. CROCOEXP guarantees reproducible orchestration records, not scientific validity.
+
+For complete usage details, see [docs/user_manual_v1.0.0.md](docs/user_manual_v1.0.0.md).
 
 ## MesaRotante Pattern
 
@@ -321,3 +322,13 @@ GET_GRID - unable to find grid variable: spherical
 ```
 
 that is a model/input issue, not a CROCOEXP staging issue, assuming the grid file is visible in `runs/<run_id>/work/`.
+
+## Citation
+
+If you use CROCOEXP in research, teaching, operational preparation, or derived workflows, please cite the software. The preferred citation metadata is provided in [CITATION.cff](CITATION.cff). Cite the exact released version used, for example `v1.0.0`.
+
+If no DOI is available, cite the repository URL and release/tag:
+
+Badagnani, D. (2026). CROCOEXP Builder (v1.0.0) [Software]. https://github.com/domar1973/CROCOEXP_BUILDER
+
+CROCOEXP is an orchestration tool. Users should also cite CROCO and any forcing, bathymetry, boundary condition, observational, reanalysis, forecast, or other data/model products used in their scientific workflow as required by those projects or providers.

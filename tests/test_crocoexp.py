@@ -901,6 +901,52 @@ exit 1
             "run",
         ]:
             self.assertIn(command, result.stdout)
+        for unsupported in [
+            "MPI execution is supported",
+            "OPENACC execution is supported",
+            "XIOS execution is supported",
+            "OASIS execution is supported",
+            "AGRIF execution is supported",
+            "run.env configuration",
+            "enter the Docker container",
+        ]:
+            self.assertNotIn(unsupported, result.stdout)
+
+    def test_command_help_text_reflects_v1_contract(self):
+        cases = [
+            (["setup", "--help"], ["Docker backend readiness", "does not select a CROCO source"]),
+            (["source", "--help"], ["repo-level compile source registry", ".crocoexp/sources.json"]),
+            (["source", "install", "--help"], ["repo-level source registry", "does not modify experiments or input/"]),
+            (["source", "list", "--help"], ["repo-level registered compile source trees"]),
+            (["source", "inspect", "--help"], ["without invoking Docker or modifying experiments"]),
+            (["import", "--help"], ["input/", "metadata outside input/", "per-experiment source_ref"]),
+            (["inspect", "--help"], ["read-only summary", "does not create, rewrite, compile, dry-run, run, or modify input/"]),
+            (["compile", "--help"], ["Docker-backed build attempt", "compile_time.source_ref", "outside input/"]),
+            (["dry-run", "--help"], ["does not invoke Docker", "does not", "launch CROCO", "source run.env"]),
+            (["run", "--help"], ["Consume metadata/dry_run_plan.json", "relative symlinks to input/", "serial/OpenMP"]),
+        ]
+        for args, expected_fragments in cases:
+            with self.subTest(args=args):
+                result = self.run_cli(args)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                for fragment in expected_fragments:
+                    self.assertIn(fragment, result.stdout)
+                for unsupported in [
+                    "MPI execution is supported",
+                    "OPENACC execution is supported",
+                    "XIOS execution is supported",
+                    "OASIS execution is supported",
+                    "AGRIF execution is supported",
+                    "run.env configuration",
+                    "enter the Docker container",
+                ]:
+                    self.assertNotIn(unsupported, result.stdout)
+        dry_help = self.run_cli(["dry-run", "--help"]).stdout
+        run_help = self.run_cli(["run", "--help"]).stdout
+        self.assertNotIn("--image", dry_help)
+        self.assertNotIn("--no-docker", dry_help)
+        self.assertNotIn("--image", run_help)
+        self.assertNotIn("--require-dry-run", run_help)
 
     def test_setup_docker_image_present(self):
         with tempfile.TemporaryDirectory() as tmp:
