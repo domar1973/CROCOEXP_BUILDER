@@ -20,7 +20,9 @@ The builder is infrastructure-oriented and traceability-oriented. It does not pr
 
 ## Repository Commands
 
-Development note: this repository is readying the v1.0.0 command surface for tagging. The implemented slices cover setup, source registry, import, inspect, compile, dry-run, run, and acceptance-level workflow coverage.
+Development note: this repository is readying the v1.0.1 command surface for tagging. The implemented slices cover setup, source registry, experiment import/list/unimport, inspect, compile, dry-run, run, and acceptance-level workflow coverage.
+
+Commands may be invoked from the repo root or from subdirectories inside the repo. CROCOEXP resolves operational paths through the detected repo root and persists repo-internal operational paths as repo-relative POSIX paths in metadata. External absolute paths are allowed only as informational provenance such as `origin_path`; operational external paths are rejected with an explicit diagnostic.
 
 Check and record Docker backend readiness:
 
@@ -31,13 +33,13 @@ Check and record Docker backend readiness:
 Use `--pull` when you want setup to pull the selected image if it is missing:
 
 ```bash
-./crocoexp setup --image domarcroco/images-for-croco:base_croco_msot-1.0.0 --pull
+./crocoexp setup --image domarcroco/images-for-croco:base_croco-1.0.1 --pull
 ```
 
 Register a compile source tree by copying it into the managed sources area:
 
 ```bash
-./crocoexp source install /path/to/croco-source --id croco-v2.1.2 --flavor croco --version v2.1.2
+./crocoexp source install /path/to/croco-source --id croco-v2.1.2 --version v2.1.2
 ```
 
 List and inspect registered sources:
@@ -45,9 +47,11 @@ List and inspect registered sources:
 ```bash
 ./crocoexp source list
 ./crocoexp source inspect croco-v2.1.2
+./crocoexp source uninstall croco-v2.1.2
+./crocoexp source uninstall croco-v2.1.2 --force
 ```
 
-Supported source flavors are `croco`, `msot`, and `custom`. Flavor is traceability metadata; it is not semantic validation.
+CROCOEXP v1.0.1 registers CROCO source trees only. Uninstalling a source never deletes experiments; experiments that reference the removed source retain an orphaned `compile_time.source_ref` and later commands report that clearly.
 
 ## Experiment Workflow
 
@@ -68,22 +72,30 @@ CROCO_EXPERIMENTS/my_experiment/
 Import the experiment and select its compile source:
 
 ```bash
-./crocoexp import minimal
-./crocoexp import minimal --source croco-msot-local
+./crocoexp import minimal --source croco-local
 ./crocoexp import my_experiment --source croco-v2.1.2
 ```
 
-`input/` is the canonical user-provided evidence folder. Import writes generated metadata under `metadata/`, creates managed `build/` and `runs/` directories if needed, and does not modify `input/`. Import with `--source` records a per-experiment source reference; it does not select a global CROCO version, compile CROCO, or run CROCO.
+`input/` is the canonical user-provided evidence folder. Import writes generated metadata under `metadata/`, creates managed `build/` and `runs/` directories if needed, and does not modify `input/`. Import with `--source` records a per-experiment source reference; it does not select a global CROCO version, compile CROCO, or run CROCO. If `--source` is omitted in a TTY, import offers a numbered selector over registered sources. If it is omitted without TTY, import fails and prints the `source list` and explicit import commands to run.
 
 During import, `croco.in` is recorded as an artifact but is not treated as universal CROCO semantic truth. `run.env`, if present, is ignored and recorded with a warning.
 
 Inspect current metadata:
 
 ```bash
+./crocoexp experiment list
 ./crocoexp inspect minimal
 ./crocoexp inspect minimal --json
 ./crocoexp inspect my_experiment
 ```
+
+To unimport an experiment without deleting user input data:
+
+```bash
+./crocoexp experiment unimport minimal
+```
+
+Unimport removes CROCOEXP-managed metadata/build state and preserves `CROCO_EXPERIMENTS/<experiment>/input/`.
 
 `inspect` is read-only. It reads `metadata/manifest.json`, reports recorded artifact-level findings and warnings, and does not modify `input/`, metadata, source registry state, or setup config. It does not compile, dry-run, or run CROCO, and it does not prove scientific correctness, compile correctness, runtime semantic compatibility, or experiment well-posedness.
 
@@ -91,10 +103,12 @@ Compile through Docker from the host:
 
 ```bash
 ./crocoexp compile minimal
+./crocoexp compile minimal --clean
+./crocoexp compile minimal --no-clean
 ./crocoexp compile my_experiment
 ```
 
-`compile` uses the per-experiment source reference recorded during import. Docker is used only as the backend; build staging, logs, `metadata/compile_attempt.json`, and `metadata/compile_report.md` are written outside `input/`. Compile does not run CROCO, and compile success does not prove scientific correctness or runtime semantic compatibility.
+`compile` uses the per-experiment source reference recorded during import. Docker is used only as the backend; build staging, logs, `metadata/compile_attempt.json`, and `metadata/compile_report.md` are written outside `input/`. If previous compile artifacts are detected, non-interactive use must choose `--clean` or `--no-clean`; interactive use asks before modifying build state. Compile does not run CROCO, and compile success does not prove scientific correctness or runtime semantic compatibility.
 
 Generate a pre-execution report without running CROCO:
 
@@ -117,7 +131,7 @@ Attempt a CROCO run through Docker:
 
 `run` consumes `metadata/dry_run_plan.json`, materializes a run-local workdir under `runs/<run_id>/work/`, exposes runtime data assets using relative symlinks back to `input/`, and launches CROCO through Docker as a backend. It does not compile CROCO. It records logs, snapshots, output inventory, `runs/<run_id>/reports/run_attempt.json`, and `runs/<run_id>/reports/run_report.md`.
 
-Run success records an execution attempt only. It does not prove scientific correctness, runtime semantic compatibility, or experiment well-posedness. MPI, OPENACC, XIOS, OASIS, AGRIF, and other specialized execution profiles remain out of scope for v1.0.0 unless explicitly implemented and tested.
+Run success records an execution attempt only. It does not prove scientific correctness, runtime semantic compatibility, or experiment well-posedness. MPI, OPENACC, XIOS, OASIS, AGRIF, and other specialized execution profiles remain out of scope for v1.0.1 unless explicitly implemented and tested.
 
 ## Directory Layout
 
@@ -129,7 +143,7 @@ Run success records an execution attempt only. It does not prove scientific corr
 
 CROCO_EXPERIMENTS/
   sources/
-    <source_id>/        # managed copy of an official CROCO, MSOT, or custom tree
+    <source_id>/        # managed copy of a CROCO source tree
 
   <experiment_name>/
     input/              # canonical user-provided experiment evidence
@@ -168,7 +182,7 @@ Docker mounts the whole `CROCO_EXPERIMENTS` tree so workdir symlinks resolve bot
 
 ## `croco.in` And `run.env`
 
-`croco.in` is opaque to CROCOEXP by default. CROCOEXP does not parse it as universal CROCO semantic truth, because CROCO input syntax varies across versions, MSOT, and custom forks. Some versions use keys such as `GRDNAME == ...`; others use blocks such as `grid: filename`.
+`croco.in` is opaque to CROCOEXP by default. CROCOEXP does not parse it as universal CROCO semantic truth, because CROCO input syntax varies across versions and local CROCO variants. Some versions use keys such as `GRDNAME == ...`; others use blocks such as `grid: filename`.
 
 CROCOEXP guarantees filesystem visibility and execution traceability, not CROCO semantic validation. CROCO itself and its logs remain the authority for runtime model errors.
 
@@ -244,7 +258,6 @@ The selected compile source is recorded under:
   "compile_time": {
     "source_ref": {
       "source_id": "croco-v2.1.2",
-      "flavor": "croco",
       "declared_version": "v2.1.2",
       "host_path": "CROCO_EXPERIMENTS/sources/croco-v2.1.2"
     }
@@ -254,12 +267,12 @@ The selected compile source is recorded under:
 
 Reports are written for human inspection, including import, compile, dry-run, run, and setup reports. Snapshots copy effective config/code artifacts where appropriate and record references, hashes, sizes, and mappings for runtime data assets.
 
-## v1.0.0 Workflow
+## v1.0.1 Workflow
 
 ```bash
-./crocoexp setup --image domarcroco/images-for-croco:base_croco_msot-1.0.0 --pull
-./crocoexp source install /path/to/croco/source --id croco-msot-local
-./crocoexp import minimal --source croco-msot-local
+./crocoexp setup --image domarcroco/images-for-croco:base_croco-1.0.1 --pull
+./crocoexp source install /path/to/croco/source --id croco-local
+./crocoexp import minimal --source croco-local
 ./crocoexp inspect minimal
 ./crocoexp compile minimal
 ./crocoexp dry-run minimal
@@ -268,9 +281,9 @@ Reports are written for human inspection, including import, compile, dry-run, ru
 
 Before `import`, create `CROCO_EXPERIMENTS/minimal/input/` and place `croco.in`, `cppdefs.h`, `param.h`, optional `analytical.F`, and runtime data assets there.
 
-Normal use is host-side; Docker is backend only. `input/` is canonical evidence and is not modified by the workflow. Runtime data assets stay in `input/`, and `run` exposes them through relative symlinks in the run-local `work/` directory. v1.0.0 supports serial and tested OpenMP execution only; MPI, OPENACC, XIOS, OASIS, and AGRIF execution are out of scope unless explicitly implemented and tested. CROCOEXP guarantees reproducible orchestration records, not scientific validity.
+Normal use is host-side; Docker is backend only. `input/` is canonical evidence and is not modified by the workflow. Runtime data assets stay in `input/`, and `run` exposes them through relative symlinks in the run-local `work/` directory. v1.0.1 supports serial and tested OpenMP execution only; MPI, OPENACC, XIOS, OASIS, and AGRIF execution are out of scope unless explicitly implemented and tested. CROCOEXP guarantees reproducible orchestration records, not scientific validity.
 
-For complete usage details, see [docs/user_manual_v1.0.0.md](docs/user_manual_v1.0.0.md).
+For complete usage details, see [docs/user_manual_v1.0.1.md](docs/user_manual_v1.0.1.md).
 
 ## MesaRotante Pattern
 
@@ -325,10 +338,10 @@ that is a model/input issue, not a CROCOEXP staging issue, assuming the grid fil
 
 ## Citation
 
-If you use CROCOEXP in research, teaching, operational preparation, or derived workflows, please cite the software. The preferred citation metadata is provided in [CITATION.cff](CITATION.cff). Cite the exact released version used, for example `v1.0.0`.
+If you use CROCOEXP in research, teaching, operational preparation, or derived workflows, please cite the software. The preferred citation metadata is provided in [CITATION.cff](CITATION.cff). Cite the exact released version used, for example `v1.0.1`.
 
 If no DOI is available, cite the repository URL and release/tag:
 
-Badagnani, D. (2026). CROCOEXP Builder (v1.0.0) [Software]. https://github.com/domar1973/CROCOEXP_BUILDER
+Badagnani, D. (2026). CROCOEXP Builder (v1.0.1) [Software]. https://github.com/domar1973/CROCOEXP_BUILDER
 
 CROCOEXP is an orchestration tool. Users should also cite CROCO and any forcing, bathymetry, boundary condition, observational, reanalysis, forecast, or other data/model products used in their scientific workflow as required by those projects or providers.

@@ -2,27 +2,46 @@
 import argparse
 import sys
 
-from crocoexp_lib import cmd_compile, cmd_dry_run, cmd_import, cmd_inspect, cmd_run, cmd_setup, cmd_source_install, cmd_source_inspect, cmd_source_list
+from crocoexp_lib import (
+    CrocoexpError,
+    cmd_compile,
+    cmd_dry_run,
+    cmd_import,
+    cmd_experiment_list,
+    cmd_experiment_unimport,
+    cmd_inspect,
+    cmd_run,
+    cmd_setup,
+    cmd_source_install,
+    cmd_source_inspect,
+    cmd_source_list,
+    cmd_source_uninstall,
+    initialize_repo_context,
+)
 
 
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="crocoexp",
-        description="Host-side CROCOEXP v1.0.0 commands. Docker is used only as an execution backend.",
+        description="Host-side CROCOEXP v1.0.1 commands. Docker is used only as an execution backend.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""Core v1.0.0 contract:
+        epilog="""Core v1.0.1 contract:
   normal use is host-side; do not enter Docker manually
   input/ is canonical user evidence and is not modified
+  import binds each experiment to a registered CROCO source via --source
   croco.in is recorded as CROCO syntax, not parsed as universal truth
   run.env is unsupported and ignored
   serial and tested OpenMP execution are supported
   MPI, OPENACC, XIOS, OASIS, and AGRIF execution are out of scope
 
-v1.0.0 command surface:
+v1.0.1 command surface:
   setup
   source install
   source list
   source inspect
+  source uninstall
+  experiment list
+  experiment unimport
   import
   inspect
   compile
@@ -60,12 +79,11 @@ v1.0.0 command surface:
     source_install_p = source_sub.add_parser(
         "install",
         help="Copy and register a compile source tree.",
-        description="Copy a host-side CROCO/MSOT/custom source tree into the repo-level source registry. This does not modify experiments or input/.",
+        description="Copy a host-side CROCO source tree into the repo-level source registry. This does not modify experiments or input/.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     source_install_p.add_argument("path", help="Host path to the source tree to install.")
     source_install_p.add_argument("--id", required=True, dest="source_id", help="Registered source id.")
-    source_install_p.add_argument("--flavor", choices=("croco", "msot", "custom"), default="custom", help="Source flavor for traceability.")
     source_install_p.add_argument("--version", dest="declared_version", help="Declared source version or tag.")
     source_install_p.add_argument("--notes", default="", help="Human-readable source notes.")
     source_install_p.add_argument("--force", action="store_true", help="Replace an existing registered source with the same id.")
@@ -88,13 +106,45 @@ v1.0.0 command surface:
     source_inspect_p.add_argument("source_id")
     source_inspect_p.add_argument("--json", action="store_true", help="Print machine-readable summary.")
 
+    source_uninstall_p = source_sub.add_parser(
+        "uninstall",
+        help="Remove one registered compile source.",
+        description="Remove a repo-level registered CROCO source and its managed installed tree when safe. Experiments that reference it are not modified.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    source_uninstall_p.add_argument("source_id")
+    source_uninstall_p.add_argument("--force", action="store_true", help="Uninstall even if experiments reference this source.")
+
+    experiment_p = sub.add_parser(
+        "experiment",
+        help="List imported experiments.",
+        description="Inspect repo-level experiment manifests under CROCO_EXPERIMENTS.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    experiment_sub = experiment_p.add_subparsers(dest="experiment_command", required=True)
+    experiment_list_p = experiment_sub.add_parser(
+        "list",
+        help="List imported experiments.",
+        description="List imported experiments with canonical manifest metadata and source availability.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    experiment_list_p.add_argument("--json", action="store_true", help="Print machine-readable summary.")
+
+    experiment_unimport_p = experiment_sub.add_parser(
+        "unimport",
+        help="Remove CROCOEXP import metadata for one experiment.",
+        description="Conservatively unimport one experiment by removing CROCOEXP-managed metadata and generated state while preserving input/.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    experiment_unimport_p.add_argument("experiment_name")
+
     import_p = sub.add_parser(
         "import",
         help="Register and analyze an experiment input/ folder.",
-        description="Inspect an existing CROCO_EXPERIMENTS/<experiment>/input/ folder and write generated metadata outside input/. Optional --source records a per-experiment source_ref.",
+        description="Inspect an existing CROCO_EXPERIMENTS/<experiment>/input/ folder and write generated metadata outside input/. Import requires a registered CROCO source via --source, or an interactive TTY selection.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    import_p.add_argument("experiment_name")
+    import_p.add_argument("experiment_name", metavar="experiment_path")
     import_p.add_argument("--source", dest="source_id", help="Registered compile source id for this experiment.")
     import_p.add_argument("--json", action="store_true", help="Print machine-readable summary.")
 
@@ -120,6 +170,9 @@ v1.0.0 command surface:
     )
     compile_p.add_argument("--source", dest="source_id", help="Registered compile source id for this compile attempt.")
     compile_p.add_argument("--jobs", default="1", help="Compilation parallelism passed to jobcomp.")
+    clean_group = compile_p.add_mutually_exclusive_group()
+    clean_group.add_argument("--clean", action="store_true", help="Remove previous CROCOEXP-managed build artifacts before compiling.")
+    clean_group.add_argument("--no-clean", action="store_true", help="Compile without removing previous build artifacts.")
     compile_p.add_argument("--json", action="store_true", help="Print machine-readable summary.")
 
     dry_run_p = sub.add_parser(
@@ -152,6 +205,11 @@ v1.0.0 command surface:
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
+    try:
+        initialize_repo_context(args)
+    except CrocoexpError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return e.exit_code
     if args.command == "setup":
         return cmd_setup(args)
     if args.command == "source":
@@ -161,6 +219,13 @@ def main(argv=None):
             return cmd_source_list(args)
         if args.source_command == "inspect":
             return cmd_source_inspect(args)
+        if args.source_command == "uninstall":
+            return cmd_source_uninstall(args)
+    if args.command == "experiment":
+        if args.experiment_command == "list":
+            return cmd_experiment_list(args)
+        if args.experiment_command == "unimport":
+            return cmd_experiment_unimport(args)
     if args.command == "import":
         return cmd_import(args)
     if args.command == "inspect":

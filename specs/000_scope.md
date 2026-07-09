@@ -11,7 +11,7 @@
 - Keep runtime data assets such as `.nc` files in `input/` during normal workflow.
 - Expose NetCDF runtime data to model execution through relative symbolic links created in the run-local work directory.
 - Store generated metadata, build products, reports, logs, snapshots, work directories, symlink forests, and run outputs outside `input/`.
-- Support repo-level registered compile sources, selected per experiment, for official CROCO source trees, MSOT, custom forks, or patched source trees.
+- Support repo-level registered CROCO source trees, selected per experiment.
 - Store registered compile source trees under `CROCO_EXPERIMENTS/sources/<source_id>/` so Docker-backed compile operations can access them through the mounted `CROCO_EXPERIMENTS` tree.
 - Treat `croco.in` as version-specific CROCO input, not as universal semantic truth for CROCOEXP.
 - Derive a runtime execution plan from compile-time evidence such as `cppdefs.h` and `param.h` so the compiled binary is launched with a compatible backend profile.
@@ -25,9 +25,11 @@
 - Do not make hardcoded named cases the main source of experiment behavior.
 - Do not assume every CROCO experiment needs the same external NetCDF files.
 - Do not rewrite CROCO source behavior.
+- Do not manage external pipelines or non-CROCO source families.
+- Do not introduce a new source `flavor`, `kind`, `type`, `pipeline`, or backend selector for CROCO sources.
 - Do not make `crocoexp setup` choose a global CROCO version or source tree for all experiments.
 - Do not use a global CROCO version variable as the main source of compile input truth.
-- Do not assume registered compile sources are only official CROCO versions; MSOT and custom forks are valid registered sources.
+- Do not assume registered compile sources are only unmodified releases; patched source trees can be registered when they remain compilable CROCO sources.
 - Do not use symlinks to host paths outside `CROCO_EXPERIMENTS` as the normal source installation mechanism.
 - Do not parse `croco.in` as a universal asset contract, because its syntax depends on the CROCO source version.
 - Do not perform universal CROCO semantic validation in `dry-run`.
@@ -61,7 +63,7 @@ Scientific and semantic responsibility remains with the researcher and the surro
 - Compile-time findings are recorded separately from runtime findings.
 - Runtime finding extraction is descriptive only; it must not determine the symlink forest required for execution.
 - Possible inconsistencies and ambiguities are reported with evidence.
-- Compile and run may be attempted when warnings, ambiguities, contradictions, or possible semantic inconsistencies exist, unless an infrastructural blocker exists or the user selects an explicit strict policy.
+- Compile and run may be attempted when warnings, ambiguities, contradictions, or possible semantic inconsistencies exist, unless an infrastructural blocker exists.
 - A dry-run must not require manual container entry and must not perform a full model run.
 - Runs must leave inspectable logs, outputs, reports, snapshots, and the prepared work directory on the host.
 - `run.env` is not a recognized artifact. If present, it is ignored as an ordinary user file and must not affect command behavior.
@@ -108,7 +110,7 @@ CROCOEXP does not need to know whether `croco.in` uses `grid:`, `GRDNAME ==`, or
 - The previous design classified real files as ambiguous when the runtime key syntax was not recognized.
 - Required-file errors were misleading when the builder did not understand a particular CROCO input syntax.
 - Users were forced to reason about container internals instead of host-side experiment artifacts.
-- Runtime data staging depended on a universal semantic parser that cannot be correct for all CROCO/MSOT/custom forks.
+- Runtime data staging depended on a universal semantic parser that cannot be correct for all CROCO variants.
 - Compile-time and runtime concerns were blurred, making it unclear whether a failure came from missing evidence, staging, Docker, compilation, execution, or a CROCO-level issue.
 - `run.env` created an implicit templating layer whose behavior was not guaranteed by CROCOEXP.
 - Reproducibility was weakened when effective artifacts, symlink plans, logs, and command attempts were not represented as a single runtime contract.

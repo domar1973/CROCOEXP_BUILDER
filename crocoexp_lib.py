@@ -4,14 +4,16 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from datetime import datetime, timezone
+from dataclasses import dataclass
 from pathlib import Path
 
 
 SCHEMA_VERSION = "0.1"
 SOURCE_REGISTRY_SCHEMA_VERSION = 1
 CONTAINER_ROOT = "/opt/CROCO_EXPERIMENTS"
-DEFAULT_DOCKER_IMAGE = "domarcroco/images-for-croco:base_croco_msot-1.0.0"
+DEFAULT_DOCKER_IMAGE = "domarcroco/images-for-croco:base_croco-1.0.1"
 DOCKER_NETCDFLIB = "-L/opt/intel/netcdf/lib -L/opt/intel/netcdff/lib  -lnetcdff -lnetcdf"
 DOCKER_NETCDFINC = "-I/opt/intel/netcdf/include -I/opt/intel/netcdff/include"
 DOCKER_NETCDF_LD_LIBRARY_PATH = "/opt/intel/netcdf/lib:/opt/intel/netcdff/lib"
@@ -29,15 +31,100 @@ class CrocoexpError(Exception):
         self.failure_category = failure_category
 
 
+@dataclass(frozen=True)
+class RepoContext:
+    repo_root: Path
+    invocation_cwd: Path
+
+    def relpath(self, path):
+        path = Path(path)
+        abs_path = path if path.is_absolute() else self.repo_root / path
+        abs_path = abs_path.resolve()
+        try:
+            return abs_path.relative_to(self.repo_root).as_posix()
+        except ValueError:
+            return None
+
+    def display_path(self, path):
+        rel = self.relpath(path)
+        return rel if rel is not None else str(Path(path))
+
+    def resolve_repo_path(self, value, field, command="path resolution", must_exist=False):
+        path = Path(value)
+        if not path.is_absolute():
+            path = self.repo_root / path
+        try:
+            resolved = path.resolve(strict=must_exist)
+        except OSError as e:
+            raise CrocoexpError(f"unable to resolve path for {field} in {command}: {value}: {e}", 4, "metadata_or_staging")
+        if self.relpath(resolved) is None:
+            raise_external_path_error(resolved, field, command)
+        return resolved
+
+
+_ACTIVE_REPO_CONTEXT = None
+_ALLOW_EXTERNAL_OPERATIONAL_PATHS = False
+
+
+def raise_external_path_error(path, field, command):
+    raise CrocoexpError(
+        "path externo detectado: "
+        f"{path}; campo o archivo: {field}; comando: {command}; "
+        "decision humana requerida: copiar dentro del repo o redisenar politica de montaje.",
+        4,
+        "external_path_detected",
+    )
+
+
+def _has_repo_marker(path):
+    return (path / ".crocoexp").exists() or (path / "CROCO_EXPERIMENTS").exists()
+
+
+def detect_repo_root(start=None):
+    override = os.environ.get("CROCOEXP_REPO_ROOT")
+    if override:
+        return Path(override).resolve()
+    current = Path(start or Path.cwd()).resolve()
+    for candidate in [current] + list(current.parents):
+        if _has_repo_marker(candidate):
+            return candidate
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(current), "rev-parse", "--show-toplevel"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return Path(proc.stdout.strip()).resolve()
+    except FileNotFoundError:
+        pass
+    return Path(__file__).resolve().parent
+
+
+def initialize_repo_context(args=None):
+    global _ACTIVE_REPO_CONTEXT, _ALLOW_EXTERNAL_OPERATIONAL_PATHS
+    context = RepoContext(repo_root=detect_repo_root(), invocation_cwd=Path.cwd().resolve())
+    _ACTIVE_REPO_CONTEXT = context
+    _ALLOW_EXTERNAL_OPERATIONAL_PATHS = False
+    if args is not None:
+        args.repo_context = context
+    return context
+
+
+def current_repo_context():
+    global _ACTIVE_REPO_CONTEXT
+    if _ACTIVE_REPO_CONTEXT is None:
+        _ACTIVE_REPO_CONTEXT = RepoContext(repo_root=detect_repo_root(), invocation_cwd=Path.cwd().resolve())
+    return _ACTIVE_REPO_CONTEXT
+
+
 def utc_now():
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
 def repo_root():
-    override = os.environ.get("CROCOEXP_REPO_ROOT")
-    if override:
-        return Path(override).resolve()
-    return Path(__file__).resolve().parent
+    return current_repo_context().repo_root
 
 
 def setup_paths():
@@ -51,10 +138,18 @@ def setup_paths():
 
 
 def experiments_root(args):
+    global _ALLOW_EXTERNAL_OPERATIONAL_PATHS
+    context = getattr(args, "repo_context", None) or current_repo_context()
     root = Path(args.experiments_root)
+    explicit_external = root.is_absolute() and args.experiments_root != "CROCO_EXPERIMENTS"
     if not root.is_absolute():
-        root = repo_root() / root
-    return root.resolve()
+        root = context.repo_root / root
+    root = root.resolve()
+    if explicit_external and context.relpath(root) is None:
+        _ALLOW_EXTERNAL_OPERATIONAL_PATHS = True
+    elif _has_repo_marker(context.repo_root) and context.relpath(root) is None:
+        raise_external_path_error(root, "--experiments-root", getattr(args, "command", "command"))
+    return root
 
 
 def experiment_paths(args):
@@ -80,6 +175,87 @@ def rel_to(path, root):
         return str(path.relative_to(root))
     except ValueError:
         return str(path)
+
+
+def repo_rel(path):
+    rel = current_repo_context().relpath(path)
+    return rel if rel is not None else str(path)
+
+
+def posix_rel_to(path, root):
+    try:
+        return Path(path).relative_to(root).as_posix()
+    except ValueError:
+        return str(path).replace(os.sep, "/")
+
+
+INFORMATIONAL_PATH_KEYS = {"origin_path"}
+
+
+def path_value_to_absolute(value, field, command):
+    path = Path(value)
+    if path.is_absolute():
+        resolved = path.resolve()
+        if current_repo_context().relpath(resolved) is None and not _ALLOW_EXTERNAL_OPERATIONAL_PATHS:
+            raise_external_path_error(resolved, field, command)
+        return resolved
+    return current_repo_context().resolve_repo_path(path, field, command)
+
+
+def normalize_persisted_paths(value, command="metadata write", key=None):
+    if isinstance(value, dict):
+        return {k: normalize_persisted_paths(v, command, k) for k, v in value.items()}
+    if isinstance(value, list):
+        return [normalize_persisted_paths(v, command, key) for v in value]
+    if not isinstance(value, str) or key in INFORMATIONAL_PATH_KEYS:
+        return value
+    if key and (key.endswith("_path") or key.endswith("_dir") or key in {"root", "path", "source", "destination", "asset_path", "link_path", "workdir", "output_dir"}):
+        path = Path(value)
+        if path.is_absolute():
+            rel = current_repo_context().relpath(path)
+            if rel is not None:
+                return rel
+        return value.replace(os.sep, "/")
+    return value
+
+
+def strip_legacy_flavor(value):
+    if isinstance(value, dict):
+        return {k: strip_legacy_flavor(v) for k, v in value.items() if k != "flavor"}
+    if isinstance(value, list):
+        return [strip_legacy_flavor(v) for v in value]
+    return value
+
+
+def normalize_for_json_write(value, command):
+    return normalize_persisted_paths(strip_legacy_flavor(value), command)
+
+
+def validate_legacy_flavor(value, field, command):
+    if value in (None, "croco"):
+        return
+    if value == "msot":
+        raise CrocoexpError(
+            f"unsupported legacy source flavor at {field}: msot. CROCOEXP v1.0.1 only supports CROCO sources; MSOT and other pipelines are outside CROCOEXP scope.",
+            5,
+            "unsupported_source_flavor",
+        )
+    raise CrocoexpError(
+        f"unsupported legacy source flavor at {field}: {value}. CROCOEXP v1.0.1 only supports CROCO sources; migrate this source to a registered CROCO source installation.",
+        5,
+        "unsupported_source_flavor",
+    )
+
+
+def validate_legacy_flavors(value, field, command):
+    if isinstance(value, dict):
+        if "flavor" in value:
+            validate_legacy_flavor(value.get("flavor"), f"{field}.flavor", command)
+        for key, nested in value.items():
+            validate_legacy_flavors(nested, f"{field}.{key}", command)
+    elif isinstance(value, list):
+        for idx, nested in enumerate(value):
+            validate_legacy_flavors(nested, f"{field}[{idx}]", command)
 
 
 def container_path(path, exps_root):
@@ -266,7 +442,7 @@ def source_include_paths_from_manifest(manifest):
     source_ref = manifest.get("compile_time", {}).get("source_ref")
     if not source_ref or not source_ref.get("host_path"):
         return []
-    root = Path(source_ref["host_path"])
+    root = path_value_to_absolute(source_ref["host_path"], "compile_time.source_ref.host_path", "source include resolution")
     paths = [root]
     if (root / "OCEAN").is_dir():
         paths.append(root / "OCEAN")
@@ -466,7 +642,12 @@ def compile_context_rejection_reason(manifest, input_dir=None, expected_case_sym
     if not isinstance(active, list) or not isinstance(dimensions, dict):
         return "compile_time active symbols or dimensions are missing"
     source_path = compile_time.get("active_cpp_symbols_source")
-    if not source_path or not Path(source_path).is_file():
+    if source_path and source_path not in {"cpp -traditional -dM -E -DLinux input/cppdefs.h", "raw_cppdefs_parse_low_confidence"}:
+        try:
+            source_path = path_value_to_absolute(source_path, "compile_time.active_cpp_symbols_source", "compile context validation")
+        except CrocoexpError as e:
+            return str(e)
+    if not source_path or (isinstance(source_path, Path) and not source_path.is_file()):
         return "active_cpp_symbols artifact is missing"
     provenance = compile_time.get("effective_preprocessor_provenance")
     if not isinstance(provenance, dict):
@@ -474,9 +655,15 @@ def compile_context_rejection_reason(manifest, input_dir=None, expected_case_sym
     if input_dir is not None:
         cpp_path = str((input_dir / "cppdefs.h").resolve())
         param_path = str((input_dir / "param.h").resolve())
-        if provenance.get("generated_from_cppdefs_host_path") != cpp_path:
+        recorded_cpp = provenance.get("generated_from_cppdefs_host_path")
+        recorded_param = provenance.get("generated_from_param_host_path")
+        if recorded_cpp:
+            recorded_cpp = str(path_value_to_absolute(recorded_cpp, "effective_preprocessor_provenance.generated_from_cppdefs_host_path", "compile context validation"))
+        if recorded_param:
+            recorded_param = str(path_value_to_absolute(recorded_param, "effective_preprocessor_provenance.generated_from_param_host_path", "compile context validation"))
+        if recorded_cpp != cpp_path:
             return "preprocessor provenance cppdefs path mismatch"
-        if provenance.get("generated_from_param_host_path") != param_path:
+        if recorded_param != param_path:
             return "preprocessor provenance param path mismatch"
         if provenance.get("generated_from_cppdefs_hash") != sha256_file_if_exists(input_dir / "cppdefs.h"):
             return "preprocessor provenance cppdefs hash mismatch"
@@ -651,11 +838,11 @@ def evidence_item(path, input_dir, exps_root):
     stat = path.stat()
     is_data = path.suffix.lower() in DATA_SUFFIXES
     return {
-        "id": f"evidence.{rel_to(path, input_dir).replace(os.sep, '.')}",
+        "id": f"evidence.{posix_rel_to(path, input_dir).replace('/', '.')}",
         "role": role_for(path),
         "host_path": str(path),
         "container_path": container_path(path, exps_root),
-        "relative_path_from_input": rel_to(path, input_dir),
+        "relative_path_from_input": posix_rel_to(path, input_dir),
         "exists": True,
         "kind": file_kind(path),
         "size_bytes": stat.st_size,
@@ -675,12 +862,12 @@ def asset_item(path, input_dir, exps_root):
     else:
         materialization_policy = "metadata_only"
     return {
-        "id": f"asset.{rel_to(path, input_dir).replace(os.sep, '.')}",
+        "id": f"asset.{posix_rel_to(path, input_dir).replace('/', '.')}",
         "role": role_for(path),
         "source": "input_scan",
         "host_path": str(path),
         "container_path": container_path(path, exps_root),
-        "relative_path_from_input": rel_to(path, input_dir),
+        "relative_path_from_input": posix_rel_to(path, input_dir),
         "compile_time_relevance": "compile_artifact" if path.name in {"cppdefs.h", "param.h", "analytical.F"} else "not_selected",
         "runtime_relevance": "runtime_data_asset" if is_data else "not_interpreted",
         "classification": "runtime_data" if is_data else ("primary_artifact" if path.name in PRIMARY_ARTIFACTS else "other_user_file"),
@@ -696,7 +883,7 @@ def asset_item(path, input_dir, exps_root):
 def import_file_entry(path, experiment_root, kind):
     stat = path.stat()
     return {
-        "path": rel_to(path, experiment_root),
+        "path": posix_rel_to(path, experiment_root),
         "kind": kind,
         "size_bytes": stat.st_size,
         "sha256": sha256_file(path),
@@ -761,12 +948,15 @@ def load_manifest(path):
     if not path.exists():
         return None
     with path.open("r", encoding="utf-8") as f:
-        return json.load(f)
+        manifest = json.load(f)
+    validate_legacy_flavors(manifest, str(path), "manifest read")
+    return strip_legacy_flavor(manifest)
 
 
 def write_manifest(manifest, path):
     path.parent.mkdir(parents=True, exist_ok=True)
     manifest["experiment"]["updated_at"] = utc_now()
+    manifest = normalize_for_json_write(manifest, "manifest write")
     tmp = path.with_suffix(".json.tmp")
     with tmp.open("w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, sort_keys=True)
@@ -784,8 +974,82 @@ def ensure_importable(paths):
         raise CrocoexpError(f"missing required input artifact(s): {', '.join(missing)}", 3, "missing_artifact")
 
 
+def same_resolved_path(left, right):
+    return Path(left).resolve(strict=False) == Path(right).resolve(strict=False)
+
+
+def resolve_import_target(args):
+    raw_value = getattr(args, "experiment_name")
+    raw = Path(raw_value)
+    context = getattr(args, "repo_context", None) or current_repo_context()
+    if raw_value in {"", ".", ".."}:
+        validate_experiment_name(raw_value)
+    if raw.is_absolute():
+        origin = raw.resolve(strict=False)
+    else:
+        cwd_candidate = (context.invocation_cwd / raw).resolve(strict=False)
+        if cwd_candidate.exists():
+            origin = cwd_candidate
+        else:
+            validate_experiment_name(raw_value)
+            canonical_candidate = (experiments_root(args) / raw).resolve(strict=False)
+            origin = canonical_candidate
+    if not origin.exists():
+        raise CrocoexpError(f"missing experiment directory: {origin}", 6, "missing_experiment_input")
+    if not origin.is_dir():
+        raise CrocoexpError(f"experiment path is not a directory: {origin}", 6, "missing_experiment_input")
+    if not os.access(origin, os.R_OK | os.X_OK):
+        raise CrocoexpError(f"experiment directory is not readable: {origin}", 6, "missing_experiment_input")
+    experiment_name = origin.name
+    validate_experiment_name(experiment_name)
+    canonical = (experiments_root(args) / experiment_name).resolve(strict=False)
+    in_place = same_resolved_path(origin, canonical)
+    if canonical.exists() and not in_place:
+        raise CrocoexpError(
+            f"experiment name already exists: {experiment_name}\n"
+            f"Canonical path already present: {repo_rel(canonical)}\n"
+            "Choose a different folder name or remove/unimport the existing experiment.",
+            4,
+            "experiment_exists",
+        )
+    return {"origin": origin, "canonical": canonical, "experiment_name": experiment_name, "in_place": in_place}
+
+
+def cleanup_partial_import_copy(path):
+    try:
+        resolved = Path(path).resolve(strict=False)
+        resolved.relative_to(repo_root().resolve())
+        if resolved.exists() and not resolved.is_symlink():
+            shutil.rmtree(resolved)
+            return None
+    except (OSError, ValueError) as e:
+        return str(e)
+    return None
+
+
+def materialize_import_target(args, target):
+    args.experiment_name = target["experiment_name"]
+    args.import_copied_from = None
+    args.import_copied_to = None
+    if target["in_place"]:
+        return experiment_paths(args)
+    try:
+        target["canonical"].parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(target["origin"], target["canonical"], symlinks=True)
+    except OSError as e:
+        cleanup_error = cleanup_partial_import_copy(target["canonical"])
+        cleanup_note = f"; additionally unable to clean partial copy: {cleanup_error}" if cleanup_error else ""
+        raise CrocoexpError(f"unable to copy experiment into canonical location: {e}{cleanup_note}", 4, "metadata_or_staging")
+    args.import_copied_from = str(target["origin"])
+    args.import_copied_to = str(target["canonical"])
+    return experiment_paths(args)
+
+
 def refresh_manifest(args, command_name="import", record_command=True):
-    paths = experiment_paths(args)
+    target = resolve_import_target(args)
+    args.experiment_name = target["experiment_name"]
+    source_ref = resolve_import_source(args, command_name)
+    paths = materialize_import_target(args, target)
     ensure_importable(paths)
     paths["metadata"].mkdir(parents=True, exist_ok=True)
     paths["build"].mkdir(parents=True, exist_ok=True)
@@ -799,13 +1063,6 @@ def refresh_manifest(args, command_name="import", record_command=True):
         manifest["history"] = old.get("history", [])
         manifest["overrides"] = old.get("overrides", [])
         manifest["snapshots"] = old.get("snapshots", manifest["snapshots"])
-
-    old_source_ref = old.get("compile_time", {}).get("source_ref") if old else None
-    source_id = getattr(args, "source_id", None)
-    if source_id:
-        source_ref = resolve_registered_source(source_id, f"{command_name} --source")
-    else:
-        source_ref = old_source_ref
 
     tokens, token_warnings = unresolved_template_tokens(paths["input"])
     compile_context = runtime_compile_context(paths, old)
@@ -895,6 +1152,9 @@ def refresh_manifest(args, command_name="import", record_command=True):
         "status": "imported",
         "warnings": warnings,
     }
+    if getattr(args, "import_copied_from", None):
+        manifest["import"]["origin_path"] = args.import_copied_from
+        manifest["import"]["canonical_path"] = str(paths["experiment_root"])
     manifest["evidence"] = {
         "primary_artifacts": primary_entries,
         "runtime_data_assets": runtime_data_entries,
@@ -1060,6 +1320,8 @@ def load_source_registry():
         raise CrocoexpError(f"unable to read source registry {path}: {e}", 4, "metadata_or_staging")
     if "sources" not in registry or not isinstance(registry["sources"], dict):
         raise CrocoexpError(f"invalid source registry shape: {path}", 4, "metadata_or_staging")
+    validate_legacy_flavors(registry, str(path), "source registry read")
+    registry = strip_legacy_flavor(registry)
     registry.setdefault("schema_version", SOURCE_REGISTRY_SCHEMA_VERSION)
     return registry
 
@@ -1070,7 +1332,7 @@ def write_source_registry(registry):
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".json.tmp")
         with tmp.open("w", encoding="utf-8") as f:
-            json.dump(registry, f, indent=2, sort_keys=True)
+            json.dump(normalize_for_json_write(registry, "source registry write"), f, indent=2, sort_keys=True)
             f.write("\n")
         tmp.replace(path)
     except OSError as e:
@@ -1095,7 +1357,6 @@ def validate_run_id(run_id):
 def source_ref_from_record(record, selection_source):
     return {
         "source_id": record["source_id"],
-        "flavor": record.get("flavor"),
         "declared_version": record.get("declared_version"),
         "host_path": record.get("host_path"),
         "installed_path": record.get("installed_path") or record.get("host_path"),
@@ -1117,15 +1378,74 @@ def resolve_registered_source(source_id, selection_source):
     registry = load_source_registry()
     record = registry["sources"].get(source_id)
     if record is None:
-        raise CrocoexpError(f"unknown registered source id: {source_id}; install it with 'crocoexp source install'", 5, "source_not_found")
-    host_path = Path(record.get("host_path", ""))
+        raise CrocoexpError(f"unknown registered source id: {source_id}; run 'crocoexp source list' to see available sources", 5, "source_not_found")
+    host_path = path_value_to_absolute(record.get("host_path", ""), f".crocoexp/sources.json sources.{source_id}.host_path", selection_source)
     if not host_path.is_dir():
         raise CrocoexpError(f"registered source tree is missing on disk: {host_path}", 5, "source_not_found")
-    return source_ref_from_record(record, selection_source)
+    normalized = dict(record)
+    normalized["host_path"] = str(host_path)
+    normalized["installed_path"] = str(host_path)
+    return source_ref_from_record(normalized, selection_source)
+
+
+def available_source_records():
+    registry = load_source_registry()
+    return [(source_id, record) for source_id, record in sorted(registry.get("sources", {}).items())]
+
+
+def no_sources_error():
+    return CrocoexpError(
+        "no registered CROCO sources found; install one with 'crocoexp source install /path/to/croco --id croco-v2.1.3'",
+        5,
+        "source_not_found",
+    )
+
+
+def missing_source_error(experiment_name):
+    return CrocoexpError(
+        "missing required import source; run 'crocoexp source list' and then "
+        f"'crocoexp import {experiment_name} --source <source_id>'",
+        5,
+        "source_not_found",
+    )
+
+
+def prompt_for_source(args, command_name):
+    records = available_source_records()
+    if not records:
+        raise no_sources_error()
+    if not sys.stdin.isatty():
+        raise missing_source_error(args.experiment_name)
+    print("Available CROCO sources:", file=sys.stderr)
+    for idx, (source_id, record) in enumerate(records, start=1):
+        version = record.get("declared_version") or "unknown-version"
+        path = record.get("host_path") or record.get("installed_path") or "unknown-path"
+        print(f"{idx}. {source_id} ({version}) - {path}", file=sys.stderr)
+    print("Select a source number, or 'q' to cancel.", file=sys.stderr)
+    for _ in range(3):
+        choice = input("Source: ").strip()
+        if choice.lower() in {"q", "quit", "cancel"}:
+            raise CrocoexpError("source selection cancelled; import aborted without writing metadata", 5, "source_not_found")
+        try:
+            index = int(choice)
+        except ValueError:
+            print("Invalid selection; enter a number from the list or 'q'.", file=sys.stderr)
+            continue
+        if 1 <= index <= len(records):
+            return resolve_registered_source(records[index - 1][0], f"{command_name} interactive source selection")
+        print("Invalid selection; enter a number from the list or 'q'.", file=sys.stderr)
+    raise CrocoexpError("invalid source selection; import aborted without writing metadata", 5, "source_not_found")
+
+
+def resolve_import_source(args, command_name):
+    source_id = getattr(args, "source_id", None)
+    if source_id:
+        return resolve_registered_source(source_id, f"{command_name} --source")
+    return prompt_for_source(args, command_name)
 
 
 def source_compile_host_path(source_ref):
-    root = Path(source_ref["host_path"])
+    root = path_value_to_absolute(source_ref["host_path"], "source_ref.host_path", "compile")
     if (root / "OCEAN" / "jobcomp").is_file() or source_ref.get("detected_layout") == "croco_ocean_subdir":
         return root / "OCEAN"
     return root
@@ -1135,13 +1455,246 @@ def summarize_source_registry(registry):
     return [
         {
             "source_id": source_id,
-            "flavor": record.get("flavor"),
             "declared_version": record.get("declared_version"),
             "host_path": record.get("host_path"),
             "installed_at": record.get("installed_at"),
         }
         for source_id, record in sorted(registry.get("sources", {}).items())
     ]
+
+
+def manifest_source_ids(manifest):
+    ids = set()
+    source_ref = manifest.get("compile_time", {}).get("source_ref")
+    if isinstance(source_ref, dict) and source_ref.get("source_id"):
+        ids.add(source_ref["source_id"])
+    legacy_ref = manifest.get("source_ref")
+    if isinstance(legacy_ref, dict) and legacy_ref.get("source_id"):
+        ids.add(legacy_ref["source_id"])
+    for key in ("source_id", "compile_source_id"):
+        value = manifest.get(key)
+        if isinstance(value, str) and value:
+            ids.add(value)
+    compile_attempt = manifest.get("compile", {}).get("last_attempt")
+    if isinstance(compile_attempt, dict) and compile_attempt.get("source_id"):
+        ids.add(compile_attempt["source_id"])
+    return ids
+
+
+def find_source_dependents(args, source_id):
+    root = experiments_root(args)
+    dependents = []
+    manifest_errors = []
+    if not root.exists():
+        return dependents, manifest_errors
+    for manifest_path in sorted(root.glob("*/metadata/manifest.json")):
+        try:
+            manifest = load_manifest(manifest_path)
+        except (OSError, json.JSONDecodeError, CrocoexpError) as e:
+            manifest_errors.append({"path": manifest_path, "error": str(e)})
+            continue
+        if manifest and source_id in manifest_source_ids(manifest):
+            dependents.append({"experiment_name": manifest_path.parents[1].name, "manifest_path": manifest_path})
+    return dependents, manifest_errors
+
+
+def safe_source_tree_to_remove(args, record):
+    raw_path = record.get("host_path") or record.get("installed_path")
+    if not raw_path:
+        return None, "source registry has no installed path"
+    path = Path(raw_path)
+    if not path.is_absolute():
+        path = repo_root() / path
+    path = path.resolve(strict=False)
+    repo = repo_root().resolve()
+    managed = sources_root(args).resolve()
+    try:
+        path.relative_to(repo)
+    except ValueError:
+        return None, f"registered source path is outside the repo and will not be removed: {path}"
+    try:
+        path.relative_to(managed)
+    except ValueError:
+        return None, f"registered source path is outside managed sources and will not be removed: {path}"
+    if path.is_symlink():
+        return None, f"registered source path is a symlink and will not be followed or removed: {path}"
+    if not path.exists():
+        return None, f"registered source tree is already absent: {path}"
+    if not path.is_dir():
+        return None, f"registered source path is not a directory and will not be removed: {path}"
+    return path, None
+
+
+def print_source_uninstall_success(source_id, removed_tree, warnings, dependents):
+    print(f"Uninstalled source: {source_id}")
+    if removed_tree:
+        print(f"Removed installed tree: {repo_rel(removed_tree)}")
+    for warning in warnings:
+        print(f"WARNING: {warning}")
+    if dependents:
+        print("Orphaned experiment source references:")
+        for item in dependents:
+            print(f"  - {item['experiment_name']}")
+
+
+def confirm_source_uninstall(source_id, dependents):
+    print(f"Source {source_id} is used by {len(dependents)} experiment(s):")
+    for item in dependents:
+        print(f"  - {item['experiment_name']}")
+    print("")
+    print("Uninstalling it will leave those experiments with orphaned source references.")
+    answer = input("Continue? [y/N] ").strip().lower()
+    return answer in {"y", "yes"}
+
+
+def experiment_list_records(args):
+    registry = load_source_registry()
+    records = []
+    root = experiments_root(args)
+    if not root.exists():
+        return records
+    for manifest_path in sorted(root.glob("*/metadata/manifest.json")):
+        manifest = load_manifest(manifest_path)
+        if not manifest:
+            continue
+        source_ref = manifest.get("compile_time", {}).get("source_ref")
+        source_id = source_ref.get("source_id") if isinstance(source_ref, dict) else None
+        if source_id and source_id in registry.get("sources", {}):
+            source_status = "available"
+        elif source_id:
+            source_status = "orphaned"
+        else:
+            source_status = "missing"
+        records.append(
+            {
+                "experiment_name": manifest_path.parents[1].name,
+                "path": repo_rel(manifest_path.parents[1]),
+                "manifest_path": repo_rel(manifest_path),
+                "source_id": source_id,
+                "source_status": source_status,
+                "imported_at": manifest.get("import", {}).get("imported_at"),
+                "updated_at": manifest.get("experiment", {}).get("updated_at"),
+            }
+        )
+    return records
+
+
+def print_experiment_list(records):
+    if not records:
+        print("No experiments registered.")
+        print("Import one with:")
+        print("  crocoexp import /path/to/experiment --source <source_id>")
+        return
+    print("Experiments:")
+    for record in records:
+        print(f"  {record['experiment_name']}")
+        print(f"    path: {record['path']}")
+        source = record["source_id"] or "none"
+        print(f"    source: {source} ({record['source_status']})")
+        timestamp = record.get("imported_at") or record.get("updated_at")
+        if timestamp:
+            print(f"    imported_at: {timestamp}")
+        print("")
+
+
+UNIMPORT_MANAGED_NAMES = ("metadata", "build", "runs", "reports", "snapshots", "logs")
+
+
+def unimport_paths(args):
+    validate_experiment_name(args.experiment_name)
+    root = (experiments_root(args) / args.experiment_name).resolve(strict=False)
+    repo = repo_root().resolve()
+    try:
+        root.relative_to(repo)
+    except ValueError:
+        raise_external_path_error(root, "experiment_name", "experiment unimport")
+    return {
+        "experiment_root": root,
+        "manifest": root / "metadata" / "manifest.json",
+    }
+
+
+def ensure_safe_unimport_root(root):
+    if not root.exists():
+        raise CrocoexpError(
+            f"experiment not found: {root.name}\nRun:\n  crocoexp experiment list",
+            3,
+            "missing_experiment_input",
+        )
+    if root.is_symlink():
+        raise CrocoexpError(f"experiment path is a symlink and will not be modified: {repo_rel(root)}", 4, "metadata_or_staging")
+    if not root.is_dir():
+        raise CrocoexpError(f"experiment path is not a directory: {repo_rel(root)}", 6, "missing_experiment_input")
+
+
+def ensure_imported_experiment_for_unimport(root, manifest_path):
+    metadata_dir = root / "metadata"
+    if metadata_dir.is_symlink() or manifest_path.is_symlink():
+        raise CrocoexpError(f"experiment metadata is a symlink and will not be followed: {repo_rel(metadata_dir)}", 4, "metadata_or_staging")
+    if not manifest_path.is_file():
+        raise CrocoexpError(
+            f"{repo_rel(root)} exists but is not an imported experiment.\nNo files were modified.",
+            5,
+            "not_imported",
+        )
+    load_manifest(manifest_path)
+
+
+def remove_managed_unimport_path(path, experiment_root):
+    resolved_parent = path.parent.resolve(strict=False)
+    repo = repo_root().resolve()
+    exp = experiment_root.resolve(strict=False)
+    try:
+        resolved_parent.relative_to(repo)
+        resolved_parent.relative_to(exp)
+    except ValueError:
+        raise_external_path_error(path, path.name, "experiment unimport")
+    if not path.exists() and not path.is_symlink():
+        return False
+    if path.is_symlink():
+        return False
+    if path.is_file():
+        path.unlink()
+    elif path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+    return True
+
+
+def unimport_experiment(args):
+    paths = unimport_paths(args)
+    root = paths["experiment_root"]
+    ensure_safe_unimport_root(root)
+    ensure_imported_experiment_for_unimport(root, paths["manifest"])
+    removed = []
+    for name in UNIMPORT_MANAGED_NAMES:
+        path = root / name
+        if remove_managed_unimport_path(path, root):
+            removed.append(name)
+    preserved = []
+    for child in sorted(root.iterdir(), key=lambda item: item.name):
+        if child.name not in UNIMPORT_MANAGED_NAMES:
+            preserved.append(child.name)
+    return {"experiment_name": args.experiment_name, "root": root, "removed": removed, "preserved": preserved}
+
+
+def print_unimport_success(summary):
+    print(f"Unimported experiment: {summary['experiment_name']}")
+    input_path = summary["root"] / "input"
+    if input_path.exists() or input_path.is_symlink():
+        print(f"Preserved user input: {repo_rel(input_path)}")
+    if summary["removed"]:
+        print("Removed CROCOEXP metadata/build state:")
+        for name in summary["removed"]:
+            print(f"  {name}")
+    else:
+        print("Removed CROCOEXP metadata/build state: none")
+    preserved = [name for name in summary["preserved"] if name != "input"]
+    if preserved:
+        print("Preserved possibly user-managed directory:")
+        for name in preserved:
+            print(f"  {name}")
 
 
 def run_docker_command(args):
@@ -1352,7 +1905,7 @@ def cmd_source_install(args):
         validate_source_id(args.source_id)
         origin = Path(args.path)
         if not origin.is_absolute():
-            origin = (Path.cwd() / origin).resolve()
+            origin = (current_repo_context().invocation_cwd / origin).resolve()
         if not origin.exists():
             raise CrocoexpError(f"missing source path: {origin}", 3, "missing_artifact")
         if not origin.is_dir():
@@ -1378,7 +1931,6 @@ def cmd_source_install(args):
             "source_id": args.source_id,
             "host_path": str(dest),
             "container_path": container_path(dest, experiments_root(args)),
-            "flavor": args.flavor,
             "declared_version": args.declared_version,
             "installed_at": utc_now(),
             "origin_path": str(origin),
@@ -1400,7 +1952,6 @@ def cmd_source_install(args):
         write_source_registry(registry)
         summary = {
             "source_id": args.source_id,
-            "flavor": record["flavor"],
             "declared_version": record["declared_version"],
             "origin_path": record["origin_path"],
             "host_path": record["host_path"],
@@ -1442,6 +1993,77 @@ def cmd_source_inspect(args):
         return e.exit_code
 
 
+def cmd_source_uninstall(args):
+    try:
+        validate_source_id(args.source_id)
+        registry = load_source_registry()
+        record = registry["sources"].get(args.source_id)
+        if record is None:
+            raise CrocoexpError(f"unknown registered source id: {args.source_id}; run 'crocoexp source list' to see available sources", 5, "source_not_found")
+
+        dependents, manifest_errors = find_source_dependents(args, args.source_id)
+        if manifest_errors:
+            details = "; ".join(f"{item['path']}: {item['error']}" for item in manifest_errors)
+            raise CrocoexpError(f"unable to verify source dependencies because manifest(s) could not be read: {details}", 4, "metadata_or_staging")
+
+        if dependents and not args.force:
+            if not sys.stdin.isatty():
+                raise CrocoexpError(
+                    f"source {args.source_id} is used by {len(dependents)} experiment(s). Re-run with --force to uninstall anyway.",
+                    5,
+                    "source_in_use",
+                )
+            if not confirm_source_uninstall(args.source_id, dependents):
+                raise CrocoexpError("source uninstall cancelled; no changes made", 5, "source_in_use")
+
+        tree_to_remove, tree_warning = safe_source_tree_to_remove(args, record)
+        warnings = [tree_warning] if tree_warning else []
+        removed_tree = None
+        if tree_to_remove is not None:
+            try:
+                shutil.rmtree(tree_to_remove)
+            except OSError as e:
+                raise CrocoexpError(f"unable to remove installed source tree {tree_to_remove}: {e}", 4, "metadata_or_staging")
+            removed_tree = tree_to_remove
+
+        registry["sources"].pop(args.source_id)
+        write_source_registry(registry)
+        print_source_uninstall_success(args.source_id, removed_tree, warnings, dependents)
+        return 0
+    except CrocoexpError as e:
+        print(f"ERROR: {e}", file=os.sys.stderr)
+        return e.exit_code
+
+
+def cmd_experiment_list(args):
+    try:
+        records = experiment_list_records(args)
+        if args.json:
+            print(json.dumps({"experiments": records}, indent=2, sort_keys=True))
+        else:
+            print_experiment_list(records)
+        return 0
+    except CrocoexpError as e:
+        print(f"ERROR: {e}", file=os.sys.stderr)
+        return e.exit_code
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"ERROR: unable to list experiments: {e}", file=os.sys.stderr)
+        return 4
+
+
+def cmd_experiment_unimport(args):
+    try:
+        summary = unimport_experiment(args)
+        print_unimport_success(summary)
+        return 0
+    except CrocoexpError as e:
+        print(f"ERROR: {e}", file=os.sys.stderr)
+        return e.exit_code
+    except OSError as e:
+        print(f"ERROR: unable to unimport experiment: {e}", file=os.sys.stderr)
+        return 4
+
+
 def cmd_import(args):
     try:
         manifest, paths = refresh_manifest(args, "import")
@@ -1452,6 +2074,13 @@ def cmd_import(args):
         summary = manifest_summary(manifest)
         summary["import_report"] = str(report)
         summary["report"] = str(canonical_report)
+        if getattr(args, "import_copied_from", None):
+            summary["copied_from"] = args.import_copied_from
+            summary["copied_to"] = repo_rel(paths["experiment_root"])
+            if not args.json:
+                print("Copied experiment into canonical location:")
+                print(f"  from: {args.import_copied_from}")
+                print(f"  to:   {repo_rel(paths['experiment_root'])}")
         print_or_json(summary, args.json)
         return 0
     except CrocoexpError as e:
@@ -1529,7 +2158,9 @@ def inspect_read_only_checks(manifest, paths):
     source_ref = manifest.get("compile_time", {}).get("source_ref")
     if isinstance(source_ref, dict):
         installed_path = source_ref.get("installed_path") or source_ref.get("host_path")
-        if installed_path and not Path(installed_path).exists():
+        if installed_path:
+            installed_path = path_value_to_absolute(installed_path, "compile_time.source_ref.installed_path", "inspect")
+        if installed_path and not installed_path.exists():
             warnings.append(f"recorded source installed path missing: {installed_path}")
 
     return {"warnings": warnings}
@@ -1633,8 +2264,6 @@ def stage_compile_inputs(paths):
     stage = paths["build"] / "stage"
     logs = paths["build"] / "logs"
     output = paths["build"] / "output"
-    if stage.exists():
-        shutil.rmtree(stage)
     stage.mkdir(parents=True, exist_ok=True)
     logs.mkdir(parents=True, exist_ok=True)
     output.mkdir(parents=True, exist_ok=True)
@@ -1661,6 +2290,161 @@ def stage_compile_inputs(paths):
     return stage, logs, output, staged
 
 
+COMPILE_METADATA_ARTIFACTS = ("compile_attempt.json", "compile_report.md")
+
+
+def previous_compile_artifacts(paths, manifest):
+    artifacts = []
+    build = paths["build"]
+    if build.exists() or build.is_symlink():
+        if build.is_symlink():
+            artifacts.append(build)
+        elif build.is_dir():
+            for child in sorted(build.iterdir(), key=lambda p: p.name):
+                artifacts.append(child)
+    for name in COMPILE_METADATA_ARTIFACTS:
+        path = paths["metadata"] / name
+        if path.exists() or path.is_symlink():
+            artifacts.append(path)
+    compile_attempt = manifest.get("compile", {}).get("last_attempt")
+    if isinstance(compile_attempt, dict) and compile_attempt:
+        artifacts.append(paths["manifest"])
+    return artifacts
+
+
+def summarize_compile_artifacts(paths, artifacts):
+    summary = []
+    for path in artifacts:
+        if path == paths["manifest"]:
+            label = "metadata/manifest.json compile.last_attempt"
+        else:
+            label = repo_rel(path)
+            exp_root = paths["experiment_root"]
+            try:
+                label = path.relative_to(exp_root).as_posix()
+            except ValueError:
+                pass
+            if path.is_dir() and not path.is_symlink():
+                label = f"{label}/"
+        if label not in summary:
+            summary.append(label)
+    return summary
+
+
+def prompt_compile_clean_decision(args, artifacts_summary):
+    print(f"Previous compile artifacts detected for experiment {args.experiment_name}:")
+    for item in artifacts_summary[:10]:
+        print(f"  {item}")
+    if len(artifacts_summary) > 10:
+        print(f"  ... {len(artifacts_summary) - 10} more")
+    print("")
+    print("Choose:")
+    print("  [c] clean and continue")
+    print("  [k] keep and continue")
+    print("  [a] abort")
+    answer = input("Selection [a]: ").strip().lower()
+    if answer in {"c", "clean"}:
+        return "clean"
+    if answer in {"k", "keep"}:
+        return "no-clean"
+    return "abort"
+
+
+def resolve_compile_clean_policy(args, paths, manifest):
+    artifacts = previous_compile_artifacts(paths, manifest)
+    summary = summarize_compile_artifacts(paths, artifacts)
+    if args.clean:
+        return "clean", artifacts, summary
+    if args.no_clean:
+        return "no-clean", artifacts, summary
+    if not artifacts:
+        return "none", artifacts, summary
+    if not sys.stdin.isatty():
+        raise CrocoexpError(
+            f"previous compile artifacts detected for experiment {args.experiment_name}.\n"
+            "Run one of:\n"
+            f"  crocoexp compile {args.experiment_name} --clean\n"
+            f"  crocoexp compile {args.experiment_name} --no-clean",
+            5,
+            "previous_compile_artifacts",
+        )
+    decision = prompt_compile_clean_decision(args, summary)
+    if decision == "abort":
+        raise CrocoexpError("compile aborted; previous compile artifacts were left unchanged", 5, "previous_compile_artifacts")
+    return decision, artifacts, summary
+
+
+def ensure_safe_build_path(path, paths):
+    repo = repo_root().resolve()
+    exps_root = paths["experiments_root"].resolve(strict=False)
+    exp = paths["experiment_root"].resolve(strict=False)
+    build = paths["build"].resolve(strict=False)
+    target = Path(path)
+    if target.is_symlink():
+        lexical_parent = target.parent if target.is_absolute() else (paths["experiment_root"] / target).parent
+        try:
+            if not _ALLOW_EXTERNAL_OPERATIONAL_PATHS:
+                lexical_parent.resolve(strict=False).relative_to(repo)
+            lexical_parent.resolve(strict=False).relative_to(exps_root)
+            lexical_parent.resolve(strict=False).relative_to(exp)
+        except ValueError:
+            raise_external_path_error(target, "compile clean symlink", "compile --clean")
+        if target == paths["build"]:
+            return
+        try:
+            target.parent.resolve(strict=False).relative_to(build)
+        except ValueError:
+            allowed_metadata = {paths["metadata"] / name for name in COMPILE_METADATA_ARTIFACTS}
+            if target not in allowed_metadata:
+                raise CrocoexpError(f"refusing to clean non-build symlink: {repo_rel(target)}", 4, "metadata_or_staging")
+        return
+    resolved = target.resolve(strict=False)
+    try:
+        if not _ALLOW_EXTERNAL_OPERATIONAL_PATHS:
+            resolved.relative_to(repo)
+        resolved.relative_to(exps_root)
+        resolved.relative_to(exp)
+    except ValueError:
+        raise_external_path_error(target, "compile clean artifact", "compile --clean")
+    if target == paths["manifest"] or target == paths["input"] or target == paths["metadata"]:
+        raise CrocoexpError(f"refusing to clean protected path: {repo_rel(target)}", 4, "metadata_or_staging")
+    if target == paths["build"]:
+        return
+    try:
+        resolved.relative_to(build)
+    except ValueError:
+        allowed_metadata = {paths["metadata"] / name for name in COMPILE_METADATA_ARTIFACTS}
+        if target not in allowed_metadata:
+            raise CrocoexpError(f"refusing to clean non-build path: {repo_rel(target)}", 4, "metadata_or_staging")
+
+
+def remove_compile_artifact(path, paths):
+    path = Path(path)
+    if path == paths["manifest"]:
+        return False
+    ensure_safe_build_path(path, paths)
+    if not path.exists() and not path.is_symlink():
+        return False
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+    return True
+
+
+def clean_previous_compile_artifacts(paths, artifacts):
+    removed = []
+    for path in artifacts:
+        if remove_compile_artifact(path, paths):
+            removed.append(repo_rel(path))
+    if paths["build"].exists() and not paths["build"].is_symlink():
+        paths["build"].mkdir(parents=True, exist_ok=True)
+    paths["metadata"].mkdir(parents=True, exist_ok=True)
+    return removed
+
+
 def resolve_compile_source(args, manifest):
     requested = getattr(args, "source_id", None)
     if requested:
@@ -1668,7 +2452,17 @@ def resolve_compile_source(args, manifest):
     existing = manifest.get("compile_time", {}).get("source_ref")
     if not existing or not existing.get("source_id"):
         raise CrocoexpError("missing compile source; import with '--source <source_id>' before compile", 5, "source_not_found")
-    return resolve_registered_source(existing["source_id"], "manifest compile_time.source_ref")
+    try:
+        return resolve_registered_source(existing["source_id"], "manifest compile_time.source_ref")
+    except CrocoexpError as e:
+        if e.failure_category == "source_not_found" and str(e).startswith("unknown registered source id"):
+            raise CrocoexpError(
+                f"orphaned compile source reference: {existing['source_id']}; run 'crocoexp source list' to see available sources. "
+                "Reinstall the source or reimport the experiment with a valid source.",
+                e.exit_code,
+                e.failure_category,
+            )
+        raise
 
 
 def detect_compile_entrypoints(source_path):
@@ -1681,9 +2475,11 @@ def detect_compile_entrypoints(source_path):
 
 
 def copy_compile_source_to_stage(source_ref, stage):
-    source_path = Path(source_ref.get("host_path") or source_ref.get("installed_path", ""))
+    source_path = path_value_to_absolute(source_ref.get("host_path") or source_ref.get("installed_path", ""), "source_ref.host_path", "compile")
     staged_source = stage / "source"
-    if staged_source.exists():
+    if staged_source.is_symlink() or staged_source.is_file():
+        staged_source.unlink()
+    elif staged_source.exists():
         shutil.rmtree(staged_source)
     shutil.copytree(source_path, staged_source, symlinks=False)
     return staged_source
@@ -1706,7 +2502,7 @@ def find_compile_binary(paths):
 def write_compile_attempt(path, attempt):
     tmp = path.with_suffix(".json.tmp")
     with tmp.open("w", encoding="utf-8") as f:
-        json.dump(attempt, f, indent=2, sort_keys=True)
+        json.dump(normalize_for_json_write(attempt, "compile attempt write"), f, indent=2, sort_keys=True)
         f.write("\n")
     tmp.replace(path)
 
@@ -2249,13 +3045,14 @@ def resolve_run_plan(paths, plan, run_id):
     binary_path = execution.get("binary_path") or plan.get("binary_path")
     if not binary_path:
         raise CrocoexpError("dry-run plan has no binary path", 10, "missing_compile_binary")
-    if not Path(binary_path).is_file():
+    binary_path = path_value_to_absolute(binary_path, "dry_run_plan.binary_path", "run")
+    if not binary_path.is_file():
         raise CrocoexpError(f"recorded binary path is missing on disk: {binary_path}", 10, "missing_compile_binary")
     if run_id != plan.get("run_id"):
         materialization = dry_run_materialization_plan(paths, run_id, planned_runtime_assets_from_manifest(plan, paths))
         execution = dict(execution)
         execution["working_directory"] = str(paths["runs"] / run_id / "work")
-    return materialization, execution, Path(binary_path)
+    return materialization, execution, binary_path
 
 
 def symlink_relative(src, dest):
@@ -2371,7 +3168,7 @@ def inventory_run_outputs(run_dir):
 def write_run_attempt(path, attempt):
     tmp = path.with_suffix(".json.tmp")
     with tmp.open("w", encoding="utf-8") as f:
-        json.dump(attempt, f, indent=2, sort_keys=True)
+        json.dump(normalize_for_json_write(attempt, "run attempt write"), f, indent=2, sort_keys=True)
         f.write("\n")
     tmp.replace(path)
 
@@ -2438,7 +3235,7 @@ def load_compile_attempt(paths, manifest):
     binary = attempt.get("binary")
     if not isinstance(binary, dict) or not binary.get("path"):
         raise CrocoexpError("latest compile attempt has no recorded binary path", 10, "missing_compile_binary")
-    binary_path = Path(binary["path"])
+    binary_path = path_value_to_absolute(binary["path"], "compile.last_attempt.binary.path", "dry-run")
     if not binary_path.is_file():
         raise CrocoexpError(f"recorded compile binary is missing on disk: {binary_path}", 10, "missing_compile_binary")
     return attempt, binary_path
@@ -2575,7 +3372,7 @@ def dry_run_execution_plan(paths, manifest, binary_path, workdir):
 def write_dry_run_plan(path, plan):
     tmp = path.with_suffix(".json.tmp")
     with tmp.open("w", encoding="utf-8") as f:
-        json.dump(plan, f, indent=2, sort_keys=True)
+        json.dump(normalize_for_json_write(plan, "dry-run plan write"), f, indent=2, sort_keys=True)
         f.write("\n")
     tmp.replace(path)
 
@@ -2925,6 +3722,20 @@ def cmd_compile(args):
 
         source_ref = resolve_compile_source(args, manifest)
         manifest["compile_time"]["source_ref"] = source_ref
+        clean_policy, previous_artifacts, previous_artifact_summary = resolve_compile_clean_policy(args, paths, manifest)
+        cleaned_artifacts = []
+        if clean_policy == "clean":
+            cleaned_artifacts = clean_previous_compile_artifacts(paths, previous_artifacts)
+            manifest.pop("compile", None)
+            manifest.pop("build", None)
+            if not args.json:
+                print("Cleaned previous compile artifacts:")
+                for item in cleaned_artifacts:
+                    print(f"  {item}")
+                if not cleaned_artifacts:
+                    print("  none")
+        elif clean_policy == "no-clean" and previous_artifacts and not args.json:
+            print("Continuing without cleaning previous compile artifacts.")
         stage, logs, output, staged = stage_compile_inputs(paths)
         staged_source = copy_compile_source_to_stage(source_ref, stage)
         staged.append({"source": source_ref["host_path"], "destination": str(staged_source), "reason": "registered_source_tree_copy"})
@@ -3006,6 +3817,10 @@ def cmd_compile(args):
             "Compile is an attempted Docker-backed build; runtime semantic findings do not block it by default.",
             f"Registered compile source selected: {source_ref['source_id']}",
         ]
+        if clean_policy == "clean":
+            findings.append("Previous compile artifacts were cleaned before this compile attempt.")
+        elif clean_policy == "no-clean":
+            findings.append("Compile continued without cleaning previous compile artifacts.")
         warnings = list(manifest.get("reporting", {}).get("warnings", []))
         manifest["compile_time"]["staged_inputs"] = staged
         manifest["docker_backend"]["image"] = docker_image
@@ -3069,6 +3884,9 @@ def cmd_compile(args):
             "binary": binary,
             "staged_inputs": staged,
             "compile_entrypoints": entrypoints,
+            "clean_policy": clean_policy,
+            "previous_compile_artifacts": previous_artifact_summary,
+            "cleaned_artifacts": cleaned_artifacts,
         }
         write_compile_attempt(attempt_path, attempt)
         if binary:
@@ -3111,6 +3929,9 @@ def cmd_compile(args):
                 "failure_category": failure_category,
                 "docker_image": docker_image,
                 "source_id": source_ref["source_id"],
+                "clean_policy": clean_policy,
+                "cleaned_artifacts": cleaned_artifacts,
+                "previous_compile_artifacts": previous_artifact_summary,
             }
         )
         print_or_json(summary, args.json)

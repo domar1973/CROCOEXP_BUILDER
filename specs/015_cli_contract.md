@@ -56,6 +56,16 @@ Source registry state is stored under:
 
 Registered sources are compile infrastructure. They are not experiment `input/` evidence and are not selected by `crocoexp setup`.
 
+### Repo root and path policy
+
+`crocoexp` commands must behave the same whether invoked from the repo root or from any subdirectory inside the repo, including subdirectories under `CROCO_EXPERIMENTS/<experiment_name>/` or `.crocoexp/`.
+
+The CLI must discover a repo root using CROCOEXP markers such as `.crocoexp/` and `CROCO_EXPERIMENTS/`, with git root only as a fallback when needed. Implementations must not use global `os.chdir()` as the normal mechanism for path correctness.
+
+Operational paths may be resolved to absolute paths internally. Persisted operational paths in manifests, source refs, and metadata must be repo-root-relative POSIX paths when they point inside the repo. Absolute external paths are allowed only for explicitly informational fields such as `origin_path`.
+
+If an operational path escapes the repo through `..` or an absolute external path, the command must fail instead of continuing silently. The diagnostic should name the path, field or file, command, and require a human decision such as copying data into the repo or redesigning the mount policy.
+
 ### Runtime workdir policy
 
 `crocoexp run` must create a run-local workdir:
@@ -139,7 +149,7 @@ Infrastructural blockers include:
 - unsupported compiled runtime backend such as MPI, MPI+OpenMP, OpenACC, XIOS, or OASIS
 - planned OpenMP thread count exceeding parsed `NPP`
 
-Possible semantic mismatches, contradictions, suspicious combinations, and ambiguities are findings by default. They may become hard failures only when an explicit strict policy is requested.
+Possible semantic mismatches, contradictions, suspicious combinations, and ambiguities are findings by default, not hard failures.
 
 ### Exit code model
 
@@ -150,12 +160,12 @@ Recommended exit codes:
 - `2`: invalid CLI usage or missing argument
 - `3`: missing primary required artifact or unsafe/missing file needed for workdir materialization
 - `4`: artifact parsing, metadata/reporting, or workdir preparation failure
-- `5`: optional strict-policy failure for warnings, ambiguity, contradiction, or possible semantic mismatch
+- `5`: actionable policy or registry failure, such as missing/orphaned source, source in use without confirmation, non-interactive import without source, or previous compile artifacts requiring explicit clean/no-clean
 - `7`: Docker/backend failure
 - `8`: compile failure
 - `9`: run failure
 
-Exit code `5` is reserved for explicit strict behavior. It is not a default failure code for ambiguity, contradiction, suspicious combinations, or possible semantic mismatch.
+Exit code `5` is not a default failure code for ambiguity, contradiction, suspicious combinations, or possible semantic mismatch. It is used for explicit policy decisions and registry/source selection failures that require user action.
 
 ## `crocoexp source install <path> --id <source_id>`
 
@@ -167,7 +177,7 @@ Register a compile source tree by copying it into:
 CROCO_EXPERIMENTS/sources/<source_id>/
 ```
 
-This command supports official CROCO source trees, MSOT, custom forks, and patched source trees. Source registration is about reproducible compile input provenance, not semantic validation of the source.
+This command supports official CROCO source trees and patched CROCO source trees. Source registration is about reproducible compile input provenance, not semantic validation of the source.
 
 ### Minimal arguments
 
@@ -177,8 +187,7 @@ This command supports official CROCO source trees, MSOT, custom forks, and patch
 ### Optional arguments
 
 - `--experiments-root <path>`
-- `--flavor <croco|msot|custom>`: declared source flavor.
-- `--declared-version <value>`: human-declared version or tag.
+- `--version <value>`: human-declared version or tag.
 - `--notes <text>`: human-readable notes.
 - `--force`: replace an existing registered source with the same `source_id`.
 - `--json`: emit machine-readable summary.
@@ -202,7 +211,7 @@ Must not modify experiment `input/` directories or experiment manifests.
 
 ### Minimal user-visible diagnostics
 
-The command must print source id, origin path, installed host path, flavor, declared version, detected git branch/commit when practical, registry path, and any replacement warning from `--force`.
+The command must print source id, origin path, installed host path, declared version, detected git branch/commit when practical, registry path, and any replacement warning from `--force`.
 
 ### Docker usage
 
@@ -244,7 +253,7 @@ None. This command is read-only.
 
 ### Minimal user-visible diagnostics
 
-The command must print source id, installed host path, flavor, declared version, and install timestamp.
+The command must print source id, installed host path, declared version, and install timestamp.
 
 ### Docker usage
 
@@ -285,7 +294,7 @@ None. This command is read-only.
 
 ### Minimal user-visible diagnostics
 
-The command must print source id, flavor, declared version, installed host path, origin path copied from, install timestamp, detected layout, git branch and commit when available, and content identity when practical.
+The command must print source id, declared version, installed host path, origin path copied from, install timestamp, detected layout, git branch and commit when available, and content identity when practical.
 
 ### Docker usage
 
@@ -301,40 +310,64 @@ Read-only.
 
 ## Optional strict flags
 
-Optional strict flags may include:
+No strict flags are part of the v1.0.1 CLI surface. Possible semantic mismatches remain findings.
 
-- `--strict`: fail on warning, suspicious finding, contradiction, or possible semantic mismatch.
-- `--fail-on-warning`: fail when warnings are produced.
-- `--require-clean-dry-run`: require dry-run with no warnings before run.
-
-Default behavior remains permissive and traceable.
-
-## `crocoexp import <experiment_name>`
+## `crocoexp source uninstall <source_id>`
 
 ### Purpose
 
-Register and analyze an existing experiment whose user-provided artifacts already live in:
+Remove one registered CROCO source from the repo-level source registry and remove its managed installed tree when safe. Experiments are never deleted or modified by source uninstall.
+
+### Minimal arguments
+
+- `<source_id>`
+
+### Optional arguments
+
+- `--experiments-root <path>`
+- `--force`: uninstall even when one or more experiments still reference the source.
+
+### Behavior
+
+- If the source is unknown, fail and suggest `crocoexp source list`.
+- If imported experiments reference the source, list the affected experiments.
+- In TTY mode, ask for confirmation unless `--force` is provided.
+- In non-TTY mode, fail unless `--force` is provided.
+- Remove only the managed source tree under `CROCO_EXPERIMENTS/sources/<source_id>/`.
+- Do not follow or delete symlink targets outside the repo.
+- Do not modify dependent experiment manifests; those experiments retain orphaned `compile_time.source_ref` values.
+
+### Exit code behavior
+
+- `0`: source uninstalled.
+- `4`: dependency scan, metadata, or safe deletion failed.
+- `5`: source unknown, source in use without confirmation/force, or operation cancelled.
+
+## `crocoexp import <experiment_path>`
+
+### Purpose
+
+Register and analyze an existing experiment folder.
 
 ```text
 CROCO_EXPERIMENTS/<experiment_name>/input/
 ```
 
+The canonical imported location is `CROCO_EXPERIMENTS/<experiment_name>/`. If the input folder is outside that canonical location, import copies the full experiment directory into the canonical location first, then imports the copy. The original folder is not modified.
+
 Import creates generated metadata and the managed experiment structure outside `input/`. It does not create a named case profile and does not prove that the experiment will compile or run.
 
-When `--source <source_id>` is provided, import records the selected registered compile source under `compile_time.source_ref`. This is per-experiment traceability, not a global source/version setting.
+Every imported experiment must be associated with a registered CROCO source under `compile_time.source_ref`. `--source <source_id>` is the non-interactive way to select that source. If `--source` is omitted in TTY mode, import offers a numbered selector over registered sources. If `--source` is omitted without TTY, import fails and suggests `crocoexp source list` and `crocoexp import EXP --source <source_id>`. If no sources are registered, import fails and suggests `crocoexp source install /path/to/croco --id croco-v2.1.3`.
 
 ### Minimal arguments
 
-- `<experiment_name>`: name of an existing directory under `CROCO_EXPERIMENTS/`.
+- `<experiment_path>`: existing experiment directory path. The experiment name is inferred from the folder name.
 
 ### Optional arguments
 
 - `--experiments-root <path>`: defaults to `CROCO_EXPERIMENTS`.
 - `--source <source_id>`: select a registered compile source for this experiment.
-- `--force`: recompute generated metadata even if a manifest already exists.
 - `--json`: emit machine-readable summary.
-- `--no-docker-check`: skip Docker availability check. Import itself should not require Docker execution.
-- `--strict`: optional mode that fails on warning, contradiction, or possible semantic mismatch.
 
 No `--env-file` or template-rendering option is part of this spec.
 
@@ -355,8 +388,8 @@ Must not create or modify files inside `input/`.
 
 - `0`: import completed and manifest written, possibly with warnings.
 - `3`: `input/croco.in`, `input/cppdefs.h`, or `input/param.h` is missing.
-- `4`: artifact parsing, metadata writing, report generation, or `--source <source_id>` registry resolution failed enough that the builder cannot record the import attempt.
-- `5`: optional strict policy failed.
+- `4`: artifact parsing, metadata writing, report generation, or canonical copy failed.
+- `5`: source selection or source registry resolution failed.
 
 ### Minimal user-visible diagnostics
 
@@ -366,6 +399,7 @@ The command must print:
 - detected primary artifacts
 - whether `input/analytical.F` exists and whether it appears relevant
 - selected registered compile source, if provided
+- canonical copy source/destination, when import copied an external experiment folder
 - NetCDF-like runtime data asset count discovered by input tree scan
 - ignored `run.env` warning, if present
 - warning and finding count
@@ -395,11 +429,44 @@ Must not modify:
 
 Import must not modify `CROCO_EXPERIMENTS/sources/<source_id>/`; it only reads the source registry to resolve `--source`.
 
+## `crocoexp experiment list`
+
+### Purpose
+
+List imported experiments by scanning canonical manifests under `CROCO_EXPERIMENTS/<experiment_name>/metadata/manifest.json`.
+
+### Optional arguments
+
+- `--experiments-root <path>`
+- `--json`: emit machine-readable summary.
+
+### Behavior
+
+- List only imported experiments with manifests.
+- Report experiment name, repo-relative path, selected source id when available, and source status.
+- Source status is `available` when the source id exists in `.crocoexp/sources.json`, `orphaned` when the manifest refers to a missing source id, and `missing` when no source ref exists.
+- Empty repos print a suggested import command.
+
+## `crocoexp experiment unimport <experiment_name>`
+
+### Purpose
+
+Conservatively remove CROCOEXP import metadata and generated state for one canonical experiment while preserving `input/`.
+
+### Behavior
+
+- Requires `CROCO_EXPERIMENTS/<experiment_name>/metadata/manifest.json`.
+- Removes CROCOEXP-managed state such as `metadata/`, `build/`, and `runs/`.
+- Preserves `input/`, user data, and NetCDF files by default.
+- Rejects path-like experiment names and folders that are not imported experiments.
+- Does not modify sources.
+- Does not provide a destructive experiment-directory deletion mode in v1.0.1.
+
 ## `crocoexp inspect <experiment_name>`
 
 ### Purpose
 
-Show current metadata, evidence, findings, runtime materialization policy, warnings, and source selection. Optionally recompute metadata from `input/`.
+Show current metadata, evidence, findings, runtime materialization policy, warnings, and source selection. Inspect is read-only.
 
 ### Minimal arguments
 
@@ -408,30 +475,19 @@ Show current metadata, evidence, findings, runtime materialization policy, warni
 ### Optional arguments
 
 - `--experiments-root <path>`
-- `--recompute`: re-read `input/` artifacts and update manifest.
 - `--json`: emit manifest summary as JSON.
-- `--assets`: include full input evidence inventory.
-- `--capabilities`: include detected compile-time findings and inferred capabilities.
-- `--mounts`: include host path to container path mappings.
-- `--strict`: optional mode that fails on warning or suspicious finding during recompute.
 
 ### Expected generated files/directories
 
-Without `--recompute`, inspect should not write files.
-
-With `--recompute`, may update:
-
-- `metadata/manifest.json`
-- `metadata/report.md`
+None. Inspect should not write files.
 
 Must not modify `input/`.
 
 ### Exit code behavior
 
 - `0`: inspection completed, possibly with warnings.
-- `3`: required primary artifacts are missing when recomputing.
-- `4`: manifest is missing or invalid and recompute was not requested.
-- `5`: optional strict policy failed during recompute.
+- `3`: manifest is missing or malformed.
+- `6`: experiment or input directory is missing.
 
 ### Minimal user-visible diagnostics
 
@@ -455,7 +511,7 @@ No existing binary is required.
 
 ### Write permissions
 
-May modify `metadata/` only when `--recompute` is used.
+Read-only.
 
 ## `crocoexp compile <experiment_name>`
 
@@ -467,7 +523,7 @@ Compile records what was attempted and what failed or succeeded. It must not fai
 
 Compile uses a registered compile source selected for the experiment. Source resolution order is:
 
-1. explicit `--source <source_id>`, if supported by the implementation
+1. explicit `--source <source_id>`
 2. `compile_time.source_ref` recorded in `metadata/manifest.json`
 3. hard failure if no source is known
 
@@ -481,11 +537,13 @@ There is no setup-level or global CROCO version/source selection.
 
 - `--experiments-root <path>`
 - `--clean`: clear generated build artifacts for this experiment before compiling.
+- `--no-clean`: compile without clearing previous build artifacts.
 - `--image <name-or-id>`: Docker image to use.
 - `--source <source_id>`: optional override for the compile source used in this attempt.
 - `--jobs <n>`: build parallelism.
 - `--json`: emit machine-readable build summary.
-- `--strict`: optional mode that fails before compile on warnings or suspicious findings.
+
+When previous compile artifacts are detected and neither `--clean` nor `--no-clean` is provided, TTY mode must ask whether to clean, keep, or abort. Non-TTY mode must fail and ask for one of the explicit flags.
 
 ### Expected generated files/directories
 
@@ -507,7 +565,7 @@ Must not copy NetCDF-like runtime data assets into `build/`.
 - `0`: compile completed and binary/build product was produced.
 - `3`: primary compile artifacts or selected source are missing.
 - `4`: metadata, staging, or report generation failed.
-- `5`: optional strict policy failed before compile.
+- `5`: source reference is missing or orphaned, or previous compile artifacts require an explicit clean/no-clean decision in non-TTY mode.
 - `7`: Docker/backend failure.
 - `8`: compile process failed.
 
@@ -545,9 +603,7 @@ Dry-run is not a universal CROCO semantic validator. It does not parse `croco.in
 
 - `--experiments-root <path>`
 - `--run-id <run_id>`: use a specified dry-run id or planned run id.
-- `--image <name-or-id>`: Docker image to check/use in the plan.
 - `--json`: emit machine-readable report.
-- `--strict`: optional mode that fails on warnings or suspicious findings.
 
 ### Expected generated files/directories
 
@@ -565,7 +621,6 @@ Dry-run may construct a temporary or planned symlink plan for reporting, but it 
 - `0`: dry-run completed and no infrastructural blocker was found, possibly with warnings.
 - `3`: missing primary artifacts, missing binary, or unsafe/missing file needed for materialization.
 - `4`: metadata, report, snapshot, or materialization-plan generation failed.
-- `5`: optional strict policy failed.
 - `7`: Docker/backend readiness check failed when Docker-backed readiness is requested.
 
 ### Minimal user-visible diagnostics
@@ -613,7 +668,7 @@ Must not modify `input/`.
 
 Execute CROCO through Docker using a run-local workdir constructed from the experiment input tree and selected compiled binary.
 
-Run is an attempt. It may proceed after dry-run when metadata contains warnings or suspicious findings, unless there is an infrastructural blocker or explicit strict policy.
+Run is an attempt. It may proceed after dry-run when metadata contains warnings or suspicious findings, unless there is an infrastructural blocker.
 
 Before launching Docker, `run` must construct and apply the runtime execution plan. For OpenMP binaries, it must pass `OMP_NUM_THREADS` explicitly to Docker and write the same hard assignment in `run_inside_docker.sh`. For unsupported launch profiles, it must fail before Docker execution.
 
@@ -626,11 +681,7 @@ Before launching Docker, `run` must construct and apply the runtime execution pl
 
 - `--experiments-root <path>`
 - `--run-id <run_id>`: choose a run id instead of generating one.
-- `--image <name-or-id>`: Docker image to use.
-- `--binary <path>`: explicit compiled binary path, defaulting to the experiment build output.
-- `--clean-work`: remove an existing run workdir before materialization.
 - `--json`: emit machine-readable run summary.
-- `--strict`: optional mode that fails before run on warnings or suspicious findings.
 
 No `--env-file` or template-rendering option is part of this spec.
 
@@ -660,7 +711,6 @@ Must not create or modify files inside `input/`.
 - `0`: CROCO execution completed successfully.
 - `3`: missing primary runtime artifact, missing binary, or unsafe materialization input.
 - `4`: metadata, workdir, symlink, snapshot, or report generation failed.
-- `5`: optional strict policy failed before run.
 - `7`: Docker/backend failure.
 - `9`: CROCO execution failed.
 

@@ -31,7 +31,7 @@ crocoexp setup
 crocoexp source install /path/to/source --id <source_id>
 crocoexp source list
 crocoexp source inspect <source_id>
-crocoexp import <experiment_name> --source <source_id>
+crocoexp import <experiment_path> --source <source_id>
 crocoexp compile <experiment_name>
 crocoexp dry-run <experiment_name>
 crocoexp run <experiment_name>
@@ -131,9 +131,9 @@ The install step should:
 - verify the origin source path exists
 - copy the source tree into `CROCO_EXPERIMENTS/sources/<source_id>/`
 - register the source in `.crocoexp/sources.json`
-- record flavor, declared version, origin path, install time, and optional git metadata when practical
+- record declared version, origin path, install time, and optional git metadata when practical
 
-Registered sources may be official CROCO trees, MSOT trees, custom forks, or patched local trees. Source registration controls compile input provenance. It does not prove that the source tree is scientifically correct, technically correct, or compatible with a given experiment.
+Registered sources may be official CROCO trees or patched local CROCO trees. Source registration controls compile input provenance. It does not prove that the source tree is scientifically correct, technically correct, or compatible with a given experiment.
 
 Normal workflow must not rely on symlinks to host paths outside `CROCO_EXPERIMENTS` because those paths may not exist inside the Docker mount.
 
@@ -160,7 +160,7 @@ Optional artifacts:
 The import step should:
 
 - register the existing experiment folder
-- record selected registered compile source when invoked as `crocoexp import <experiment_name> --source <source_id>`
+- record selected registered compile source from `--source <source_id>` or interactive TTY selection
 - parse artifact-level compile evidence where practical
 - record compile-time findings separately from runtime findings
 - inventory NetCDF-like runtime data assets under `input/`
@@ -221,7 +221,7 @@ Dry-run may hard-fail by default for:
 - inability to write reports
 - inability to construct a safe workdir or symlink plan
 - Docker/backend failure when Docker-backed readiness checks are requested
-- explicit strict policy selected by the user
+- explicit infrastructural blocker requiring user action
 
 ## Run
 
@@ -243,7 +243,7 @@ The run step should:
 - snapshot effective config/code artifacts and runtime materialization inventory
 - record exit status, timing, Docker details, and failure category
 
-Run is an attempt. It may proceed after dry-run when metadata contains warnings or possible semantic inconsistencies, unless there is an infrastructural blocker or explicit strict policy.
+Run is an attempt. It may proceed after dry-run when metadata contains warnings or possible semantic inconsistencies, unless there is an infrastructural blocker.
 
 Run may hard-fail by default for:
 
@@ -254,7 +254,7 @@ Run may hard-fail by default for:
 - unsafe or broken symlink targets
 - Docker/backend failure
 - CROCO runtime failure
-- explicit strict policy selected by the user
+- explicit infrastructural blocker requiring user action
 
 ## Outputs, logs, and snapshots
 

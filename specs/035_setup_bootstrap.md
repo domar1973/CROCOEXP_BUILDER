@@ -6,7 +6,7 @@
 
 The setup slice is infrastructure readiness only. It does not import experiments, compile CROCO, run CROCO, perform dry-run semantics, prepare run workdirs, or validate scientific correctness. It records whether the host can use the configured Docker backend and which Docker image should be treated as the repo default.
 
-Setup does not choose a global CROCO source, CROCO version, MSOT tree, or custom source tree. Compile sources are registered separately with the source registry and selected per experiment.
+Setup does not choose a global CROCO source, CROCO version, CROCO source tree. Compile sources are registered separately with the source registry and selected per experiment.
 
 The command should:
 
@@ -72,7 +72,7 @@ Required `config.json` fields:
 - `last_setup_at`
 - `setup_status`
 
-`config.json` must not contain a global CROCO source id, global CROCO version, MSOT source id, experiment compile source selection, runtime input path, or `run.env` configuration. Source registry state belongs in `.crocoexp/sources.json`.
+`config.json` must not contain a global CROCO source id, global CROCO version, experiment compile source selection, runtime input path, or `run.env` configuration. Source registry state belongs in `.crocoexp/sources.json`.
 
 Recommended additional fields:
 
@@ -113,7 +113,7 @@ There is one canonical default Docker image for the repo.
 The initial default should match the current builder convention unless changed by an explicit repo decision:
 
 ```text
-domarcroco/images-for-croco:base_croco_msot-1.0.0
+domarcroco/images-for-croco:base_croco-1.0.1
 ```
 
 Rules:
@@ -228,7 +228,7 @@ Warnings may include:
 - image was pulled and should be treated as newly introduced infrastructure
 - setup config is older than the current implementation schema
 
-Warnings are recorded in `.crocoexp/config.json` and `.crocoexp/setup_report.md`. Warnings do not block setup unless an explicit future strict policy says otherwise.
+Warnings are recorded in `.crocoexp/config.json` and `.crocoexp/setup_report.md`. Warnings do not block setup in v1.0.1.
 
 ## Acceptance Criteria
 
@@ -349,7 +349,7 @@ Expected result:
 ## Relationship To Other Commands
 
 - `crocoexp source install` is responsible for registering compile source trees.
-- `crocoexp import` records per-experiment source selection.
+- `crocoexp import` requires per-experiment source selection.
 - `crocoexp compile` uses the configured Docker backend and selected source.
 - `crocoexp dry-run` reports planned runtime workdir and symlink materialization.
 - `crocoexp run` creates the runtime workdir and symlinks NetCDF assets.

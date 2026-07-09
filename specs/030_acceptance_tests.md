@@ -34,7 +34,7 @@ CROCO_EXPERIMENTS/minimal/input/param.h
 ### Command invoked
 
 ```text
-crocoexp import minimal
+crocoexp import minimal --source croco-local
 ```
 
 ### Expected result
@@ -71,7 +71,7 @@ CROCO_EXPERIMENTS/analytical_optional/input/analytical.F
 ### Command invoked
 
 ```text
-crocoexp import analytical_optional
+crocoexp import analytical_optional --source croco-v2.1.3
 ```
 
 ### Expected result
@@ -434,7 +434,7 @@ crocoexp dry-run template_tokens
 
 ### Expected success/failure
 
-Success with exit code `0`; with explicit `--strict`, failure with exit code `5` is acceptable.
+Success with exit code `0`.
 
 ## 13. Unsafe symlink target outside `CROCO_EXPERIMENTS` blocks run
 
@@ -557,7 +557,7 @@ crocoexp dry-run possible_mismatch
 
 ### Expected success/failure
 
-Success with exit code `0`. With explicit `--strict`, failure with exit code `5` is acceptable.
+Success with exit code `0`.
 
 ## 17. Source install for official CROCO tree
 
@@ -572,7 +572,7 @@ The source tree exists and is readable.
 ### Command invoked
 
 ```text
-crocoexp source install /tmp/croco-v2.1.3 --id croco-v2.1.3 --flavor croco --declared-version v2.1.3
+crocoexp source install /tmp/croco-v2.1.3 --id croco-v2.1.3 --version v2.1.3
 ```
 
 ### Expected result
@@ -585,31 +585,9 @@ crocoexp source install /tmp/croco-v2.1.3 --id croco-v2.1.3 --flavor croco --dec
 
 Success with exit code `0`.
 
-## 18. Source install for MSOT tree
+## 18. Source install rejects non-CROCO legacy registry entries
 
-### Initial filesystem setup
-
-```text
-/tmp/msot-source/
-```
-
-The source tree exists and is readable.
-
-### Command invoked
-
-```text
-crocoexp source install /tmp/msot-source --id msot-local --flavor msot
-```
-
-### Expected result
-
-- Source tree is copied under `CROCO_EXPERIMENTS/sources/msot-local/`.
-- Registry records flavor `msot`.
-- No global CROCO version is selected.
-
-### Expected success/failure
-
-Success with exit code `0`.
+Legacy registry records that declare non-CROCO source metadata must fail with a clear migration error.
 
 ## 19. Source list returns registered IDs
 
@@ -617,7 +595,7 @@ Success with exit code `0`.
 
 ```text
 CROCO_EXPERIMENTS/sources/croco-v2.1.3/
-CROCO_EXPERIMENTS/sources/msot-local/
+CROCO_EXPERIMENTS/sources/croco-local/
 .crocoexp/sources.json
 ```
 
@@ -630,7 +608,7 @@ crocoexp source list
 ### Expected result
 
 - Both source IDs are listed.
-- Output includes installed path, flavor, declared version, and install timestamp.
+- Output includes installed path, declared version, and install timestamp.
 
 ### Expected success/failure
 
@@ -728,11 +706,11 @@ CROCO_EXPERIMENTS/no_global_version/input/croco.in
 CROCO_EXPERIMENTS/no_global_version/input/cppdefs.h
 CROCO_EXPERIMENTS/no_global_version/input/param.h
 CROCO_EXPERIMENTS/no_global_version/metadata/manifest.json
-CROCO_EXPERIMENTS/sources/custom-source/
+CROCO_EXPERIMENTS/sources/croco-source/
 .crocoexp/sources.json
 ```
 
-Manifest selects `custom-source`.
+Manifest selects `croco-source`.
 
 ### Command invoked
 
@@ -742,7 +720,7 @@ crocoexp compile no_global_version
 
 ### Expected result
 
-- Compile uses `custom-source`.
+- Compile uses `croco-source`.
 - No global CROCO version is required.
 - Diagnostics show selected source id.
 
@@ -829,9 +807,139 @@ crocoexp import unknown_source --source missing-source
 
 ### Expected success/failure
 
-Failure with exit code `4` or `3`, according to implementation convention for registry resolution failure.
+Failure with exit code `5`.
 
-## 27. Runtime execution plan: OpenMP
+## 27. Import without `--source` in non-interactive mode fails
+
+### Command invoked
+
+```text
+crocoexp import import_source
+```
+
+### Expected result
+
+- Command fails without writing an incomplete manifest.
+- Diagnostic suggests `crocoexp source list`.
+- Diagnostic shows `crocoexp import EXP --source <source_id>`.
+
+### Expected success/failure
+
+Failure with exit code `5`.
+
+## 28. Source uninstall with dependents requires force without TTY
+
+### Initial filesystem setup
+
+```text
+CROCO_EXPERIMENTS/import_source/metadata/manifest.json
+CROCO_EXPERIMENTS/sources/croco-v2.1.3/
+.crocoexp/sources.json
+```
+
+Manifest references `compile_time.source_ref.source_id = croco-v2.1.3`.
+
+### Command invoked
+
+```text
+crocoexp source uninstall croco-v2.1.3
+```
+
+### Expected result
+
+- Command reports dependent experiments.
+- Source registry is not modified.
+- Experiment manifest is not modified.
+- Diagnostic suggests rerunning with `--force`.
+
+### Expected success/failure
+
+Failure with exit code `5`.
+
+## 29. Experiment list marks orphaned source references
+
+### Command invoked
+
+```text
+crocoexp experiment list
+```
+
+### Expected result
+
+- Imported experiments with manifests are listed.
+- Source status is `available` when registered.
+- Source status is `orphaned` when a manifest references a missing source id.
+
+### Expected success/failure
+
+Success with exit code `0`.
+
+## 30. Experiment unimport preserves input
+
+### Command invoked
+
+```text
+crocoexp experiment unimport import_source
+```
+
+### Expected result
+
+- `metadata/manifest.json` is removed.
+- `input/` remains.
+- NetCDF files under `input/` remain.
+- Experiment no longer appears as imported in `crocoexp experiment list`.
+
+### Expected success/failure
+
+Success with exit code `0`.
+
+## 31. Compile with previous artifacts requires explicit clean policy
+
+### Initial filesystem setup
+
+```text
+CROCO_EXPERIMENTS/compile_source_ref/build/stage/
+CROCO_EXPERIMENTS/compile_source_ref/metadata/manifest.json
+```
+
+### Command invoked
+
+```text
+crocoexp compile compile_source_ref
+```
+
+### Expected result
+
+- In non-interactive mode, command fails before staging.
+- Diagnostic requests one of:
+  - `crocoexp compile compile_source_ref --clean`
+  - `crocoexp compile compile_source_ref --no-clean`
+
+### Expected success/failure
+
+Failure with exit code `5`.
+
+## 32. Compile clean removes only build state
+
+### Command invoked
+
+```text
+crocoexp compile compile_source_ref --clean
+```
+
+### Expected result
+
+- Previous CROCOEXP-managed build artifacts are removed.
+- `input/` is preserved.
+- `metadata/manifest.json` is preserved.
+- Registered source trees are preserved.
+- Compile proceeds from a clean build state.
+
+### Expected success/failure
+
+Success with exit code `0` if compilation succeeds; otherwise documented compile or Docker failure.
+
+## 33. Runtime execution plan: OpenMP
 
 - `input/cppdefs.h` defines `OPENMP`.
 - `input/param.h` defines `parameter (NPP=8)`.
@@ -841,20 +949,20 @@ Failure with exit code `4` or `3`, according to implementation convention for re
 - `run_inside_docker.sh` contains `export OMP_NUM_THREADS=8`.
 - `run_inside_docker.sh` runs `./croco croco.in`.
 
-## 28. Runtime execution plan: unparsed NPP
+## 34. Runtime execution plan: unparsed NPP
 
 - `OPENMP` is active.
 - `NPP` cannot be parsed.
 - Dry-run warns and plans `OMP_NUM_THREADS=1`.
 - Run uses `OMP_NUM_THREADS=1`.
 
-## 29. Runtime execution plan: unsupported MPI
+## 35. Runtime execution plan: unsupported MPI
 
 - `cppdefs.h` defines `MPI`.
 - `run` fails before Docker execution with an unsupported runtime backend blocker.
 - No Docker run is attempted.
 
-## 30. Runtime execution plan: unsupported XIOS
+## 36. Runtime execution plan: unsupported XIOS
 
 - `cppdefs.h` defines `XIOS`.
 - `run` fails before Docker execution with an unsupported runtime backend blocker.

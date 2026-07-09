@@ -72,7 +72,6 @@ The registry should contain one record per source id. Required fields for each r
 - `source_id`
 - `host_path`
 - `container_path`
-- `flavor`
 - `declared_version`
 - `installed_at`
 - `origin_path`
@@ -88,6 +87,10 @@ Recommended fields when practical:
 - `warnings`
 
 This registry is repo-level infrastructure state. It is not a global source/version selector, and `crocoexp setup` must not write experiment-level source metadata.
+
+New v1.0.1 registry records and manifests must not include a `flavor` field. Legacy `flavor: "croco"` metadata may be read and normalized away on rewrite. Legacy non-CROCO flavor values are rejected with an explicit migration error because CROCOEXP v1.0.1 only supports CROCO sources.
+
+Repo-internal operational paths must be persisted as repo-root-relative POSIX paths. Absolute external paths are allowed only for explicitly informational provenance fields such as `origin_path`.
 
 ## Required manifest fields
 
@@ -217,7 +220,6 @@ Minimum `source_ref` shape:
 ```json
 {
   "source_id": "croco-v2.1.3",
-  "flavor": "croco",
   "declared_version": "v2.1.3",
   "host_path": "CROCO_EXPERIMENTS/sources/croco-v2.1.3",
   "container_path": "/opt/CROCO_EXPERIMENTS/sources/croco-v2.1.3",
@@ -637,7 +639,7 @@ The manifest must distinguish:
 - Docker/backend failure
 - compile failure
 - run failure
-- strict-policy failure
+- actionable policy failure
 
 ## Finding reporting
 

@@ -44,12 +44,12 @@ CROCO_EXPERIMENTS/sources/<source_id>/
 
 They may represent:
 
-- official CROCO source trees
-- MSOT source trees
-- custom forks
-- patched local source trees
+- CROCO source trees
+- patched local CROCO source trees
 
 The key concept is `source_id`, not a global CROCO version. A source is selected per experiment and recorded in that experiment's compile-time metadata as `compile_time.source_ref`.
+
+The v1.0.1 model has no source `flavor` field for new source records or manifests. Legacy metadata with `flavor: "croco"` may be read for compatibility and normalized away on rewrite. Legacy `flavor` values for non-CROCO sources are rejected because pipelines and non-CROCO source families are outside CROCOEXP scope.
 
 Registered source metadata is recorded in:
 
@@ -275,6 +275,8 @@ Generated metadata records:
 
 Generated metadata supports traceability and diagnostics. It should be regenerable from `input/` and command history whenever possible.
 
+Operational paths persisted in generated metadata should be repo-root-relative POSIX paths when they point inside the repo. Runtime code may resolve them to absolute paths internally. Absolute external paths are allowed only for informational provenance fields such as source `origin_path`; operational external paths must fail explicitly.
+
 ### Source registry
 
 The source registry records repo-level compile source assets installed under `CROCO_EXPERIMENTS/sources/`.
@@ -283,7 +285,6 @@ It records:
 
 - `source_id`
 - installed host path under `CROCO_EXPERIMENTS/sources/<source_id>/`
-- flavor such as `croco`, `msot`, or `custom`
 - declared version, when known
 - origin path copied from
 - installation timestamp
@@ -312,7 +313,7 @@ Rules:
 - The builder may compare compile-time and runtime information and report suspicious combinations as findings.
 - The comparison is descriptive and diagnostic, not a theorem proving step.
 - Runtime materialization and runtime execution planning must be recorded separately.
-- Compile and run commands may proceed with reported warnings or suspicious combinations unless blocked by an infrastructural blocker or explicit strict policy.
+- Compile and run commands may proceed with reported warnings or suspicious combinations unless blocked by an infrastructural blocker.
 
 ## File materialization rules
 
@@ -355,4 +356,4 @@ The builder may report:
 - config files that mention output paths under `input/`
 - compile/run suspicious combinations
 
-These are findings by default. They are not hard failures unless an explicit strict policy is selected or they prevent construction of the run work directory.
+These are findings by default. They are not hard failures unless they prevent construction of the run work directory.

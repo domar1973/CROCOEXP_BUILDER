@@ -1,5 +1,6 @@
 import json
 import os
+import pty
 import shutil
 import subprocess
 import sys
@@ -37,6 +38,50 @@ class CrocoexpTests(unittest.TestCase):
         proc_env = os.environ.copy()
         if env:
             proc_env.update(env)
+        args = list(args)
+        if "--experiments-root" in args and (env is None or "CROCOEXP_REPO_ROOT" not in env):
+            exp_root = Path(args[args.index("--experiments-root") + 1])
+            if not exp_root.is_absolute():
+                exp_root = (Path(cwd or REPO_ROOT) / exp_root).resolve()
+            proc_env["CROCOEXP_REPO_ROOT"] = str(exp_root.parent)
+        if "import" in args and "--source" not in args and "--help" not in args and proc_env.get("CROCOEXP_TEST_NO_AUTO_SOURCE") != "1":
+            exp_root = None
+            if "--experiments-root" in args:
+                exp_root = Path(args[args.index("--experiments-root") + 1])
+            elif cwd:
+                exp_root = Path(cwd) / "CROCO_EXPERIMENTS"
+            if exp_root is not None:
+                if not exp_root.is_absolute():
+                    exp_root = (Path(cwd or REPO_ROOT) / exp_root).resolve()
+                source_id = "test-auto-source"
+                repo = Path(proc_env.get("CROCOEXP_REPO_ROOT") or exp_root.parent)
+                proc_env["CROCOEXP_REPO_ROOT"] = str(repo)
+                source = exp_root / "sources" / source_id
+                ocean = source / "OCEAN"
+                ocean.mkdir(parents=True, exist_ok=True)
+                (ocean / "jobcomp").write_text("#!/usr/bin/env bash\necho test auto source\n", encoding="utf-8")
+                (ocean / "Makefile").write_text("all:\n\t@echo test\n", encoding="utf-8")
+                (source / "cppdefs.h").write_text("#define TEST_SOURCE\n", encoding="utf-8")
+                (source / "param.h").write_text("parameter (NPP=1)\n", encoding="utf-8")
+                registry_path = repo / ".crocoexp" / "sources.json"
+                registry_path.parent.mkdir(parents=True, exist_ok=True)
+                registry = {"schema_version": 1, "sources": {}}
+                if registry_path.exists():
+                    registry = json.loads(registry_path.read_text(encoding="utf-8"))
+                registry.setdefault("sources", {})[source_id] = {
+                    "source_id": source_id,
+                    "host_path": str(source),
+                    "installed_path": str(source),
+                    "container_path": f"/opt/CROCO_EXPERIMENTS/sources/{source_id}",
+                    "declared_version": "test-auto",
+                    "installed_at": "2026-01-01T00:00:00+00:00",
+                    "origin_path": str(source),
+                    "status": "installed",
+                    "detected_layout": "croco_ocean_subdir",
+                }
+                registry_path.write_text(json.dumps(registry, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                import_index = args.index("import")
+                args[import_index + 2:import_index + 2] = ["--source", source_id]
         return subprocess.run(
             [sys.executable, str(CLI)] + args,
             cwd=cwd or REPO_ROOT,
@@ -45,6 +90,44 @@ class CrocoexpTests(unittest.TestCase):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
+
+    def run_cli_pty(self, args, cwd=None, env=None, input_text=""):
+        proc_env = os.environ.copy()
+        if env:
+            proc_env.update(env)
+        master, slave = pty.openpty()
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, str(CLI)] + args,
+                cwd=cwd or REPO_ROOT,
+                env=proc_env,
+                stdin=slave,
+                stdout=slave,
+                stderr=slave,
+                text=False,
+            )
+            os.close(slave)
+            slave = None
+            if input_text:
+                os.write(master, input_text.encode("utf-8"))
+            chunks = []
+            while True:
+                try:
+                    chunk = os.read(master, 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                if proc.poll() is not None:
+                    continue
+            returncode = proc.wait()
+            output = b"".join(chunks).decode("utf-8", errors="replace")
+            return subprocess.CompletedProcess(args, returncode, output, "")
+        finally:
+            if slave is not None:
+                os.close(slave)
+            os.close(master)
 
     def fake_docker_env(self, tmp, present=True, daemon=True, pull_ok=True):
         bin_dir = Path(tmp) / "bin"
@@ -216,10 +299,16 @@ exit 1
         (source / "nested" / "data.txt").write_text("preserve me\n", encoding="utf-8")
         return source
 
-    def install_source(self, tmp, root, source_id="croco-test", flavor="croco", env=None):
+    def make_repo(self, tmp):
+        repo = Path(tmp) / "repo"
+        (repo / ".crocoexp").mkdir(parents=True)
+        (repo / "CROCO_EXPERIMENTS").mkdir()
+        return repo
+
+    def install_source(self, tmp, root, source_id="croco-test", env=None):
         source = self.make_source(tmp, f"{source_id}-origin")
         result = self.run_cli(
-            ["--experiments-root", str(root), "source", "install", str(source), "--id", source_id, "--flavor", flavor, "--version", "test"],
+            ["--experiments-root", str(root), "source", "install", str(source), "--id", source_id, "--version", "test"],
             env=env,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -245,8 +334,8 @@ exit 1
             self.assertIn("assets", manifest)
             self.assertEqual(manifest["schema_version"], 1)
             self.assertEqual(manifest["experiment"]["name"], "EXP_A")
-            self.assertEqual(manifest["experiment"]["root"], str(root / "EXP_A"))
-            self.assertEqual(manifest["experiment"]["input_dir"], str(root / "EXP_A" / "input"))
+            self.assertEqual(manifest["experiment"]["root"], "CROCO_EXPERIMENTS/EXP_A")
+            self.assertEqual(manifest["experiment"]["input_dir"], "CROCO_EXPERIMENTS/EXP_A/input")
             self.assertEqual(manifest["import"]["status"], "imported")
             self.assertEqual(manifest["runtime_materialization"]["status"], "not_prepared")
             self.assertEqual(manifest["runtime_execution_plan"]["status"], "not_planned")
@@ -265,6 +354,79 @@ exit 1
             self.assertTrue((root / "EXP_A" / "runs").is_dir())
             report = (root / "EXP_A" / "metadata" / "report.md").read_text(encoding="utf-8")
             self.assertIn("does not prove scientific correctness", report)
+
+    def test_commands_resolve_paths_from_deep_repo_subdirectory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self.make_repo(tmp)
+            root = repo / "CROCO_EXPERIMENTS"
+            self.make_exp(root, data=True)
+            source = self.make_source(tmp)
+
+            installed = self.run_cli(["source", "install", str(source), "--id", "deep-source"], cwd=repo)
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            root_import = self.run_cli(["import", "EXP_A", "--source", "deep-source", "--json"], cwd=repo)
+            deep = root / "EXP_A" / "metadata" / "nested"
+            deep.mkdir(parents=True)
+            deep_import = self.run_cli(["import", "EXP_A", "--source", "deep-source", "--json"], cwd=deep)
+            self.assertEqual(root_import.returncode, 0, root_import.stderr)
+            self.assertEqual(deep_import.returncode, 0, deep_import.stderr)
+            self.assertEqual(json.loads(root_import.stdout)["asset_classification_counts"], json.loads(deep_import.stdout)["asset_classification_counts"])
+
+            listed = self.run_cli(["source", "list", "--json"], cwd=deep)
+            self.assertEqual(listed.returncode, 0, listed.stderr)
+            self.assertIn("deep-source", listed.stdout)
+
+    def test_manifest_rewrite_normalizes_internal_absolute_paths_to_repo_relative_posix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self.make_repo(tmp)
+            root = repo / "CROCO_EXPERIMENTS"
+            exp = self.make_exp(root, data=True)
+            metadata = exp / "metadata"
+            metadata.mkdir()
+            manifest_path = metadata / "manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "experiment": {
+                            "created_at": "2026-01-01T00:00:00+00:00",
+                        },
+                        "compile_time": {},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            result = self.run_cli(["import", "EXP_A"], cwd=repo)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["experiment"]["root_host_path"], "CROCO_EXPERIMENTS/EXP_A")
+            self.assertEqual(manifest["paths"]["input_host_path"], "CROCO_EXPERIMENTS/EXP_A/input")
+            self.assertEqual(manifest["input_evidence"][0]["host_path"].split("/")[0], "CROCO_EXPERIMENTS")
+            self.assertNotIn("\\", manifest["paths"]["input_host_path"])
+
+    def test_external_operational_registry_path_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self.make_repo(tmp)
+            root = repo / "CROCO_EXPERIMENTS"
+            self.make_exp(root)
+            external = Path(tmp) / "external-source"
+            external.mkdir()
+            registry = {
+                "schema_version": 1,
+                "sources": {
+                    "external": {
+                        "source_id": "external",
+                        "host_path": str(external),
+                        "installed_path": str(external),
+                        "container_path": "/opt/CROCO_EXPERIMENTS/sources/external",
+                    }
+                },
+            }
+            (repo / ".crocoexp" / "sources.json").write_text(json.dumps(registry) + "\n", encoding="utf-8")
+            result = self.run_cli(["import", "EXP_A", "--source", "external"], cwd=repo)
+            self.assertEqual(result.returncode, 4)
+            self.assertIn("path externo detectado", result.stderr)
+            self.assertIn(".crocoexp/sources.json", result.stderr)
 
     def test_import_requires_primary_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -367,8 +529,9 @@ exit 1
 
     def test_compile_staging_does_not_copy_nc_before_docker(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "CROCO_EXPERIMENTS"
-            env = {"CROCOEXP_REPO_ROOT": str(Path(tmp) / "repo")}
+            repo = Path(tmp) / "repo"
+            root = repo / "CROCO_EXPERIMENTS"
+            env = {"CROCOEXP_REPO_ROOT": str(repo)}
             self.make_exp(root, analytical=True, data=True)
             self.install_source(tmp, root, env=env)
             import_result = self.run_cli(["--experiments-root", str(root), "import", "EXP_A", "--source", "croco-test"], env=env)
@@ -384,7 +547,7 @@ exit 1
             manifest = json.loads((root / "EXP_A" / "metadata" / "manifest.json").read_text(encoding="utf-8"))
             mounts = manifest["docker_backend"]["mounts"]
             self.assertIn(
-                {"host_path": str(root), "container_path": "/opt/CROCO_EXPERIMENTS", "mode": "ro", "purpose": "readonly_experiments_root_mount"},
+                {"host_path": "CROCO_EXPERIMENTS", "container_path": "/opt/CROCO_EXPERIMENTS", "mode": "ro", "purpose": "readonly_experiments_root_mount"},
                 mounts,
             )
             self.assertIn(":ro", manifest["docker_backend"]["compile_command_summary"])
@@ -403,11 +566,12 @@ exit 1
 
     def test_source_install_copies_tree_and_writes_registry(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "CROCO_EXPERIMENTS"
-            env = {"CROCOEXP_REPO_ROOT": str(Path(tmp) / "repo")}
+            repo = Path(tmp) / "repo"
+            root = repo / "CROCO_EXPERIMENTS"
+            env = {"CROCOEXP_REPO_ROOT": str(repo)}
             source = self.make_source(tmp)
             result = self.run_cli(
-                ["--experiments-root", str(root), "source", "install", str(source), "--id", "croco-v1", "--flavor", "croco", "--version", "v1", "--notes", "test source"],
+                ["--experiments-root", str(root), "source", "install", str(source), "--id", "croco-v1", "--version", "v1", "--notes", "test source"],
                 env=env,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -416,11 +580,11 @@ exit 1
             registry = json.loads((Path(env["CROCOEXP_REPO_ROOT"]) / ".crocoexp" / "sources.json").read_text(encoding="utf-8"))
             self.assertEqual(registry["schema_version"], 1)
             record = registry["sources"]["croco-v1"]
-            self.assertEqual(record["host_path"], str(installed))
-            self.assertEqual(record["installed_path"], str(installed))
+            self.assertEqual(record["host_path"], "CROCO_EXPERIMENTS/sources/croco-v1")
+            self.assertEqual(record["installed_path"], "CROCO_EXPERIMENTS/sources/croco-v1")
             self.assertEqual(record["installed_from"], str(source))
             self.assertEqual(record["status"], "installed")
-            self.assertEqual(record["flavor"], "croco")
+            self.assertNotIn("flavor", record)
             self.assertEqual(record["declared_version"], "v1")
             self.assertEqual(record["notes"], "test source")
             self.assertGreaterEqual(record["files_count"], 6)
@@ -433,35 +597,197 @@ exit 1
 
     def test_source_list_and_inspect(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "CROCO_EXPERIMENTS"
-            env = {"CROCOEXP_REPO_ROOT": str(Path(tmp) / "repo")}
-            self.install_source(tmp, root, source_id="msot-test", flavor="msot", env=env)
+            repo = Path(tmp) / "repo"
+            root = repo / "CROCO_EXPERIMENTS"
+            env = {"CROCOEXP_REPO_ROOT": str(repo)}
+            self.install_source(tmp, root, source_id="croco-list-test", env=env)
             listed = self.run_cli(["--experiments-root", str(root), "source", "list", "--json"], env=env)
             self.assertEqual(listed.returncode, 0, listed.stderr)
-            self.assertIn("msot-test", listed.stdout)
-            inspected = self.run_cli(["--experiments-root", str(root), "source", "inspect", "msot-test", "--json"], env=env)
+            self.assertIn("croco-list-test", listed.stdout)
+            inspected = self.run_cli(["--experiments-root", str(root), "source", "inspect", "croco-list-test", "--json"], env=env)
             self.assertEqual(inspected.returncode, 0, inspected.stderr)
             details = json.loads(inspected.stdout)
-            self.assertEqual(details["source_id"], "msot-test")
-            self.assertEqual(details["flavor"], "msot")
+            self.assertEqual(details["source_id"], "croco-list-test")
+            self.assertNotIn("flavor", details)
             self.assertIn("detected_layout", details)
             self.assertIn("detection", details)
             self.assertTrue(details["detection"]["has_jobcomp"])
 
-    def test_source_install_duplicate_without_force_fails(self):
+    def test_source_install_help_does_not_include_flavor_and_option_is_rejected(self):
+        help_result = self.run_cli(["source", "install", "--help"])
+        self.assertEqual(help_result.returncode, 0, help_result.stderr)
+        self.assertNotIn("--flavor", help_result.stdout)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "CROCO_EXPERIMENTS"
-            env = {"CROCOEXP_REPO_ROOT": str(Path(tmp) / "repo")}
+            source = self.make_source(tmp)
+            result = self.run_cli(["--experiments-root", str(root), "source", "install", str(source), "--id", "croco-v1", "--flavor", "croco"])
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("unrecognized arguments", result.stderr)
+
+    def test_source_uninstall_appears_in_source_help(self):
+        result = self.run_cli(["source", "--help"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("uninstall", result.stdout)
+
+    def test_source_install_duplicate_without_force_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            root = repo / "CROCO_EXPERIMENTS"
+            env = {"CROCOEXP_REPO_ROOT": str(repo)}
             self.install_source(tmp, root, source_id="dup-source", env=env)
             source = self.make_source(tmp, "dup-origin-2")
             result = self.run_cli(["--experiments-root", str(root), "source", "install", str(source), "--id", "dup-source"], env=env)
             self.assertEqual(result.returncode, 4)
             self.assertIn("already registered", result.stderr)
 
-    def test_source_install_rejects_unsafe_source_ids(self):
+    def test_source_uninstall_unknown_source_fails_without_modifying_registry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            root = repo / "CROCO_EXPERIMENTS"
+            env = {"CROCOEXP_REPO_ROOT": str(repo)}
+            self.install_source(tmp, root, source_id="keep-source", env=env)
+            registry_path = Path(env["CROCOEXP_REPO_ROOT"]) / ".crocoexp" / "sources.json"
+            before = registry_path.read_text(encoding="utf-8")
+            result = self.run_cli(["--experiments-root", str(root), "source", "uninstall", "missing-source"], env=env)
+            self.assertEqual(result.returncode, 5)
+            self.assertIn("crocoexp source list", result.stderr)
+            self.assertEqual(registry_path.read_text(encoding="utf-8"), before)
+
+    def test_source_uninstall_unused_removes_registry_and_managed_tree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            root = repo / "CROCO_EXPERIMENTS"
+            env = {"CROCOEXP_REPO_ROOT": str(repo)}
+            self.install_source(tmp, root, source_id="unused-source", env=env)
+            installed = root / "sources" / "unused-source"
+            result = self.run_cli(["--experiments-root", str(root), "source", "uninstall", "unused-source"], env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Uninstalled source: unused-source", result.stdout)
+            self.assertFalse(installed.exists())
+            registry = json.loads((Path(env["CROCOEXP_REPO_ROOT"]) / ".crocoexp" / "sources.json").read_text(encoding="utf-8"))
+            self.assertNotIn("unused-source", registry["sources"])
+            listed = self.run_cli(["--experiments-root", str(root), "source", "list", "--json"], env=env)
+            self.assertNotIn("unused-source", listed.stdout)
+
+    def test_source_uninstall_used_without_force_non_tty_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            root = repo / "CROCO_EXPERIMENTS"
+            env = {"CROCOEXP_REPO_ROOT": str(repo)}
+            self.make_exp(root)
+            self.install_source(tmp, root, source_id="used-source", env=env)
+            self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A", "--source", "used-source"], env=env).returncode, 0)
+            manifest_before = (root / "EXP_A" / "metadata" / "manifest.json").read_text(encoding="utf-8")
+            result = self.run_cli(["--experiments-root", str(root), "source", "uninstall", "used-source"], env=env)
+            self.assertEqual(result.returncode, 5)
+            self.assertIn("Re-run with --force", result.stderr)
+            self.assertTrue((root / "sources" / "used-source").exists())
+            self.assertEqual((root / "EXP_A" / "metadata" / "manifest.json").read_text(encoding="utf-8"), manifest_before)
+
+    def test_source_uninstall_used_with_force_removes_source_not_experiment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            root = repo / "CROCO_EXPERIMENTS"
+            env = {"CROCOEXP_REPO_ROOT": str(repo)}
+            self.make_exp(root)
+            self.install_source(tmp, root, source_id="force-source", env=env)
+            self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A", "--source", "force-source"], env=env).returncode, 0)
+            manifest_path = root / "EXP_A" / "metadata" / "manifest.json"
+            manifest_before = manifest_path.read_text(encoding="utf-8")
+            result = self.run_cli(["--experiments-root", str(root), "source", "uninstall", "force-source", "--force"], env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Orphaned experiment source references", result.stdout)
+            self.assertIn("EXP_A", result.stdout)
+            self.assertFalse((root / "sources" / "force-source").exists())
+            self.assertTrue((root / "EXP_A").exists())
+            self.assertEqual(manifest_path.read_text(encoding="utf-8"), manifest_before)
+            registry = json.loads((Path(env["CROCOEXP_REPO_ROOT"]) / ".crocoexp" / "sources.json").read_text(encoding="utf-8"))
+            self.assertNotIn("force-source", registry["sources"])
+
+    def test_source_uninstall_used_interactive_negative_keeps_everything(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            root = repo / "CROCO_EXPERIMENTS"
+            env = {"CROCOEXP_REPO_ROOT": str(repo)}
+            self.make_exp(root)
+            self.install_source(tmp, root, source_id="interactive-no", env=env)
+            self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A", "--source", "interactive-no"], env=env).returncode, 0)
+            manifest_before = (root / "EXP_A" / "metadata" / "manifest.json").read_text(encoding="utf-8")
+            result = self.run_cli_pty(["--experiments-root", str(root), "source", "uninstall", "interactive-no"], env=env, input_text="n\n")
+            self.assertEqual(result.returncode, 5)
+            self.assertIn("Continue? [y/N]", result.stdout)
+            self.assertTrue((root / "sources" / "interactive-no").exists())
+            self.assertEqual((root / "EXP_A" / "metadata" / "manifest.json").read_text(encoding="utf-8"), manifest_before)
+
+    def test_source_uninstall_used_interactive_yes_uninstalls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            root = repo / "CROCO_EXPERIMENTS"
+            env = {"CROCOEXP_REPO_ROOT": str(repo)}
+            self.make_exp(root)
+            self.install_source(tmp, root, source_id="interactive-yes", env=env)
+            self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A", "--source", "interactive-yes"], env=env).returncode, 0)
+            result = self.run_cli_pty(["--experiments-root", str(root), "source", "uninstall", "interactive-yes"], env=env, input_text="yes\n")
+            self.assertEqual(result.returncode, 0, result.stdout)
+            self.assertIn("Uninstalled source: interactive-yes", result.stdout)
+            self.assertFalse((root / "sources" / "interactive-yes").exists())
+
+    def test_source_uninstall_does_not_remove_external_or_external_symlink_target(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "CROCO_EXPERIMENTS"
-            env = {"CROCOEXP_REPO_ROOT": str(Path(tmp) / "repo")}
+            repo = Path(tmp) / "repo"
+            env = {"CROCOEXP_REPO_ROOT": str(repo)}
+            registry_path = repo / ".crocoexp" / "sources.json"
+            registry_path.parent.mkdir(parents=True)
+            external = Path(tmp) / "external-source"
+            external.mkdir()
+            (external / "keep.txt").write_text("keep\n", encoding="utf-8")
+            symlink_target = Path(tmp) / "external-target"
+            symlink_target.mkdir()
+            (symlink_target / "keep.txt").write_text("keep target\n", encoding="utf-8")
+            symlink_path = root / "sources" / "symlink-source"
+            symlink_path.parent.mkdir(parents=True)
+            symlink_path.symlink_to(symlink_target, target_is_directory=True)
+            registry = {
+                "schema_version": 1,
+                "sources": {
+                    "external-source": {"source_id": "external-source", "host_path": str(external), "installed_path": str(external)},
+                    "symlink-source": {"source_id": "symlink-source", "host_path": str(symlink_path), "installed_path": str(symlink_path)},
+                },
+            }
+            registry_path.write_text(json.dumps(registry, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            external_result = self.run_cli(["--experiments-root", str(root), "source", "uninstall", "external-source"], env=env)
+            self.assertEqual(external_result.returncode, 0, external_result.stderr)
+            self.assertTrue((external / "keep.txt").exists())
+            self.assertIn("outside", external_result.stdout)
+            symlink_result = self.run_cli(["--experiments-root", str(root), "source", "uninstall", "symlink-source"], env=env)
+            self.assertEqual(symlink_result.returncode, 0, symlink_result.stderr)
+            self.assertTrue(symlink_path.is_symlink())
+            self.assertTrue((symlink_target / "keep.txt").exists())
+            self.assertIn("symlink", symlink_result.stdout)
+
+    def test_source_uninstall_aborts_on_corrupt_manifest_without_modifying_registry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            root = repo / "CROCO_EXPERIMENTS"
+            env = {"CROCOEXP_REPO_ROOT": str(repo)}
+            self.install_source(tmp, root, source_id="blocked-source", env=env)
+            manifest_dir = root / "EXP_A" / "metadata"
+            manifest_dir.mkdir(parents=True)
+            (manifest_dir / "manifest.json").write_text("{bad json\n", encoding="utf-8")
+            registry_path = repo / ".crocoexp" / "sources.json"
+            before = registry_path.read_text(encoding="utf-8")
+            result = self.run_cli(["--experiments-root", str(root), "source", "uninstall", "blocked-source", "--force"], env=env)
+            self.assertEqual(result.returncode, 4)
+            self.assertIn("could not be read", result.stderr)
+            self.assertEqual(registry_path.read_text(encoding="utf-8"), before)
+            self.assertTrue((root / "sources" / "blocked-source").exists())
+
+    def test_source_install_rejects_unsafe_source_ids(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            root = repo / "CROCO_EXPERIMENTS"
+            env = {"CROCOEXP_REPO_ROOT": str(repo)}
             source = self.make_source(tmp)
             for source_id in ["", ".", "..", "bad/id", "bad\\id"]:
                 result = self.run_cli(["--experiments-root", str(root), "source", "install", str(source), "--id", source_id], env=env)
@@ -514,8 +840,9 @@ exit 1
 
     def test_import_with_source_records_source_ref(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "CROCO_EXPERIMENTS"
-            env = {"CROCOEXP_REPO_ROOT": str(Path(tmp) / "repo")}
+            repo = Path(tmp) / "repo"
+            root = repo / "CROCO_EXPERIMENTS"
+            env = {"CROCOEXP_REPO_ROOT": str(repo)}
             self.make_exp(root, data=True)
             self.install_source(tmp, root, source_id="croco-import", env=env)
             source_tree = root / "sources" / "croco-import"
@@ -529,8 +856,8 @@ exit 1
             manifest = json.loads((root / "EXP_A" / "metadata" / "manifest.json").read_text(encoding="utf-8"))
             source_ref = manifest["compile_time"]["source_ref"]
             self.assertEqual(source_ref["source_id"], "croco-import")
-            self.assertEqual(source_ref["host_path"], str(root / "sources" / "croco-import"))
-            self.assertEqual(source_ref["installed_path"], str(root / "sources" / "croco-import"))
+            self.assertEqual(source_ref["host_path"], "CROCO_EXPERIMENTS/sources/croco-import")
+            self.assertEqual(source_ref["installed_path"], "CROCO_EXPERIMENTS/sources/croco-import")
             self.assertEqual(source_ref["registry_path"], ".crocoexp/sources.json")
             self.assertEqual(source_ref["status"], "registered")
             self.assertFalse((root / "EXP_A" / "input" / "OCEAN").exists())
@@ -541,16 +868,344 @@ exit 1
             }
             self.assertEqual(after, before)
             self.assertEqual(manifest["commands"][-1]["source_ref"]["source_id"], "croco-import")
+            self.assertNotIn("flavor", json.dumps(manifest))
+
+    def test_import_external_experiment_copies_to_canonical_location(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            root = repo / "CROCO_EXPERIMENTS"
+            env = {"CROCOEXP_REPO_ROOT": str(repo)}
+            external_root = Path(tmp) / "external" / "MesaRotante"
+            self.make_exp(external_root.parent, name="MesaRotante", data=True)
+            (external_root / "input" / "nested").mkdir()
+            (external_root / "input" / "nested" / "extra.nc").write_bytes(b"nc")
+            self.install_source(tmp, root, source_id="croco-copy", env=env)
+            before = self.input_hashes(external_root.parent, name="MesaRotante")
+            result = self.run_cli(["--experiments-root", str(root), "import", str(external_root), "--source", "croco-copy"], env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Copied experiment into canonical location", result.stdout)
+            canonical = root / "MesaRotante"
+            self.assertTrue((canonical / "input" / "forcing.nc").exists())
+            self.assertTrue((canonical / "input" / "nested" / "extra.nc").exists())
+            self.assertTrue((canonical / "metadata" / "manifest.json").exists())
+            self.assertFalse((external_root / "metadata" / "manifest.json").exists())
+            self.assertEqual(before, self.input_hashes(external_root.parent, name="MesaRotante"))
+            manifest = json.loads((canonical / "metadata" / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["experiment"]["root"], "CROCO_EXPERIMENTS/MesaRotante")
+            self.assertEqual(manifest["compile_time"]["source_ref"]["source_id"], "croco-copy")
+            self.assertEqual(manifest["import"]["canonical_path"], "CROCO_EXPERIMENTS/MesaRotante")
+            self.assertNotIn(str(external_root), json.dumps(manifest["compile_time"]))
+
+    def test_import_external_rejects_existing_canonical_name_without_overwrite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            root = repo / "CROCO_EXPERIMENTS"
+            env = {"CROCOEXP_REPO_ROOT": str(repo)}
+            existing = self.make_exp(root, name="EXP_A", data=False)
+            sentinel = existing / "input" / "sentinel.txt"
+            sentinel.write_text("keep\n", encoding="utf-8")
+            external = self.make_exp(Path(tmp) / "external", name="EXP_A", data=True)
+            self.install_source(tmp, root, source_id="croco-existing", env=env)
+            result = self.run_cli(["--experiments-root", str(root), "import", str(external), "--source", "croco-existing"], env=env)
+            self.assertEqual(result.returncode, 4)
+            self.assertIn("experiment name already exists", result.stderr)
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep\n")
+            self.assertFalse((root / "EXP_A" / "metadata" / "manifest.json").exists())
+
+    def test_import_canonical_experiment_operates_in_place(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            root = repo / "CROCO_EXPERIMENTS"
+            env = {"CROCOEXP_REPO_ROOT": str(repo)}
+            canonical = self.make_exp(root, name="CANONICAL", data=True)
+            self.install_source(tmp, root, source_id="croco-in-place", env=env)
+            result = self.run_cli(["--experiments-root", str(root), "import", str(canonical), "--source", "croco-in-place"], env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("Copied experiment", result.stdout)
+            self.assertTrue((canonical / "metadata" / "manifest.json").exists())
+            self.assertFalse((root / "CANONICAL.1").exists())
+
+    def test_import_without_source_non_interactive_fails_without_writing_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "CROCO_EXPERIMENTS"
+            env = {"CROCOEXP_REPO_ROOT": str(Path(tmp) / "repo"), "CROCOEXP_TEST_NO_AUTO_SOURCE": "1"}
+            self.make_exp(root)
+            self.install_source(tmp, root, source_id="croco-noninteractive", env=env)
+            result = self.run_cli(["--experiments-root", str(root), "import", "EXP_A"], env=env)
+            self.assertEqual(result.returncode, 5)
+            self.assertIn("crocoexp source list", result.stderr)
+            self.assertIn("crocoexp import EXP_A --source <source_id>", result.stderr)
+            self.assertFalse((root / "EXP_A" / "metadata" / "manifest.json").exists())
+
+    def test_import_without_source_no_registered_sources_fails_with_install_hint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "CROCO_EXPERIMENTS"
+            env = {"CROCOEXP_REPO_ROOT": str(Path(tmp) / "repo"), "CROCOEXP_TEST_NO_AUTO_SOURCE": "1"}
+            self.make_exp(root)
+            result = self.run_cli(["--experiments-root", str(root), "import", "EXP_A"], env=env)
+            self.assertEqual(result.returncode, 5)
+            self.assertIn("crocoexp source install /path/to/croco --id croco-v2.1.3", result.stderr)
+            self.assertFalse((root / "EXP_A" / "metadata" / "manifest.json").exists())
+
+    def test_import_without_source_interactive_selects_only_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            root = repo / "CROCO_EXPERIMENTS"
+            env = {"CROCOEXP_REPO_ROOT": str(repo)}
+            self.make_exp(root)
+            self.install_source(tmp, root, source_id="croco-one", env=env)
+            result = self.run_cli_pty(["--experiments-root", str(root), "import", "EXP_A", "--json"], env=env, input_text="1\n")
+            self.assertEqual(result.returncode, 0, result.stdout)
+            self.assertIn("Available CROCO sources", result.stdout)
+            manifest = json.loads((root / "EXP_A" / "metadata" / "manifest.json").read_text(encoding="utf-8"))
+            source_ref = manifest["compile_time"]["source_ref"]
+            self.assertEqual(source_ref["source_id"], "croco-one")
+            self.assertEqual(source_ref["declared_version"], "test")
+            self.assertIn("git_commit", source_ref)
+            self.assertNotIn("flavor", json.dumps(manifest))
+
+    def test_import_without_source_interactive_selects_among_multiple_sources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            root = repo / "CROCO_EXPERIMENTS"
+            env = {"CROCOEXP_REPO_ROOT": str(repo)}
+            self.make_exp(root)
+            self.install_source(tmp, root, source_id="croco-first", env=env)
+            self.install_source(tmp, root, source_id="croco-second", env=env)
+            result = self.run_cli_pty(["--experiments-root", str(root), "import", "EXP_A"], env=env, input_text="2\n")
+            self.assertEqual(result.returncode, 0, result.stdout)
+            manifest = json.loads((root / "EXP_A" / "metadata" / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["compile_time"]["source_ref"]["source_id"], "croco-second")
+
+    def test_legacy_croco_flavor_is_accepted_and_removed_on_rewrite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            root = repo / "CROCO_EXPERIMENTS"
+            env = {"CROCOEXP_REPO_ROOT": str(repo)}
+            self.make_exp(root)
+            self.install_source(tmp, root, source_id="legacy-croco", env=env)
+            registry_path = Path(env["CROCOEXP_REPO_ROOT"]) / ".crocoexp" / "sources.json"
+            registry = json.loads(registry_path.read_text(encoding="utf-8"))
+            registry["sources"]["legacy-croco"]["flavor"] = "croco"
+            registry_path.write_text(json.dumps(registry, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            result = self.run_cli(["--experiments-root", str(root), "import", "EXP_A", "--source", "legacy-croco"], env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            manifest = json.loads((root / "EXP_A" / "metadata" / "manifest.json").read_text(encoding="utf-8"))
+            self.assertNotIn("flavor", json.dumps(manifest))
+            manifest["compile_time"]["source_ref"]["flavor"] = "croco"
+            manifest_path = root / "EXP_A" / "metadata" / "manifest.json"
+            manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            inspect_result = self.run_cli(["--experiments-root", str(root), "inspect", "EXP_A"], env=env)
+            self.assertEqual(inspect_result.returncode, 0, inspect_result.stderr)
+            rewrite_result = self.run_cli(["--experiments-root", str(root), "import", "EXP_A"], env=env)
+            self.assertEqual(rewrite_result.returncode, 0, rewrite_result.stderr)
+            rewritten = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertNotIn("flavor", json.dumps(rewritten))
+
+    def test_legacy_non_croco_flavors_are_rejected(self):
+        for legacy_flavor in ("msot", "custom"):
+            with self.subTest(legacy_flavor=legacy_flavor):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp) / "CROCO_EXPERIMENTS"
+                    env = {"CROCOEXP_REPO_ROOT": str(Path(tmp) / "repo")}
+                    self.make_exp(root)
+                    self.install_source(tmp, root, source_id="legacy-source", env=env)
+                    registry_path = Path(env["CROCOEXP_REPO_ROOT"]) / ".crocoexp" / "sources.json"
+                    registry = json.loads(registry_path.read_text(encoding="utf-8"))
+                    registry["sources"]["legacy-source"]["flavor"] = legacy_flavor
+                    registry_path.write_text(json.dumps(registry, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                    result = self.run_cli(["--experiments-root", str(root), "import", "EXP_A", "--source", "legacy-source"], env=env)
+                    self.assertEqual(result.returncode, 5)
+                    self.assertIn("CROCOEXP v1.0.1 only supports CROCO sources", result.stderr)
+                    if legacy_flavor == "msot":
+                        self.assertIn("pipelines are outside CROCOEXP scope", result.stderr)
+                    else:
+                        self.assertIn("registered CROCO source installation", result.stderr)
+
+    def test_legacy_non_croco_manifest_flavors_are_rejected(self):
+        for legacy_flavor in ("msot", "custom"):
+            with self.subTest(legacy_flavor=legacy_flavor):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp) / "CROCO_EXPERIMENTS"
+                    self.make_exp(root)
+                    self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A"]).returncode, 0)
+                    manifest_path = root / "EXP_A" / "metadata" / "manifest.json"
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    manifest["compile_time"]["source_ref"] = {"source_id": "legacy-source", "flavor": legacy_flavor}
+                    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                    result = self.run_cli(["--experiments-root", str(root), "inspect", "EXP_A"])
+                    self.assertEqual(result.returncode, 5)
+                    self.assertIn("CROCOEXP v1.0.1 only supports CROCO sources", result.stderr)
+
+    def test_docs_specs_and_help_do_not_advertise_source_flavor_or_pipelines(self):
+        help_result = self.run_cli(["source", "install", "--help"])
+        self.assertEqual(help_result.returncode, 0, help_result.stderr)
+        self.assertNotIn("--flavor", help_result.stdout)
+        text = "\n".join(
+            path.read_text(encoding="utf-8")
+            for base in (REPO_ROOT / "README.md", REPO_ROOT / "docs", REPO_ROOT / "specs")
+            for path in ([base] if base.is_file() else sorted(base.rglob("*.md")))
+        )
+        for forbidden in ("--flavor", "source flavor", "MSOT", "msot", "`custom`", "custom forks", "custom source"):
+            self.assertNotIn(forbidden, text)
 
     def test_import_unknown_source_fails_clearly(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "CROCO_EXPERIMENTS"
-            env = {"CROCOEXP_REPO_ROOT": str(Path(tmp) / "repo")}
+            repo = Path(tmp) / "repo"
+            root = repo / "CROCO_EXPERIMENTS"
+            env = {"CROCOEXP_REPO_ROOT": str(repo)}
             self.make_exp(root, data=True)
             result = self.run_cli(["--experiments-root", str(root), "import", "EXP_A", "--source", "missing-source"], env=env)
             self.assertEqual(result.returncode, 5)
             self.assertIn("missing-source", result.stderr)
             self.assertFalse((root / "EXP_A" / "metadata" / "manifest.json").exists())
+
+    def test_experiment_list_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            root = repo / "CROCO_EXPERIMENTS"
+            result = self.run_cli(
+                ["--experiments-root", str(root), "experiment", "list"],
+                env={"CROCOEXP_REPO_ROOT": str(repo)},
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("No experiments registered.", result.stdout)
+            self.assertIn("crocoexp import /path/to/experiment --source <source_id>", result.stdout)
+
+    def test_experiment_list_reports_available_and_orphaned_sources_from_subdir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            root = repo / "CROCO_EXPERIMENTS"
+            env = {"CROCOEXP_REPO_ROOT": str(repo)}
+            self.make_exp(root, name="EXP_A", data=True)
+            self.make_exp(root, name="EXP_B", data=True)
+            self.install_source(tmp, root, source_id="croco-list-a", env=env)
+            self.install_source(tmp, root, source_id="croco-list-b", env=env)
+            imported_a = self.run_cli(["--experiments-root", str(root), "import", "EXP_A", "--source", "croco-list-a"], env=env)
+            self.assertEqual(imported_a.returncode, 0, imported_a.stderr)
+            imported_b = self.run_cli(["--experiments-root", str(root), "import", "EXP_B", "--source", "croco-list-b"], env=env)
+            self.assertEqual(imported_b.returncode, 0, imported_b.stderr)
+            uninstalled = self.run_cli(["--experiments-root", str(root), "source", "uninstall", "croco-list-b", "--force"], env=env)
+            self.assertEqual(uninstalled.returncode, 0, uninstalled.stderr)
+
+            deep = root / "EXP_A" / "metadata" / "deep"
+            deep.mkdir(parents=True)
+            listed = self.run_cli(["experiment", "list", "--json"], cwd=deep, env=env)
+            self.assertEqual(listed.returncode, 0, listed.stderr)
+            summary = json.loads(listed.stdout)
+            by_name = {item["experiment_name"]: item for item in summary["experiments"]}
+            self.assertEqual(by_name["EXP_A"]["source_id"], "croco-list-a")
+            self.assertEqual(by_name["EXP_A"]["source_status"], "available")
+            self.assertEqual(by_name["EXP_A"]["path"], "CROCO_EXPERIMENTS/EXP_A")
+            self.assertEqual(by_name["EXP_B"]["source_id"], "croco-list-b")
+            self.assertEqual(by_name["EXP_B"]["source_status"], "orphaned")
+
+            text = self.run_cli(["experiment", "list"], cwd=deep, env=env)
+            self.assertEqual(text.returncode, 0, text.stderr)
+            self.assertIn("EXP_A", text.stdout)
+            self.assertIn("croco-list-a (available)", text.stdout)
+            self.assertIn("croco-list-b (orphaned)", text.stdout)
+
+    def test_experiment_unimport_preserves_input_and_removes_imported_listing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            root = repo / "CROCO_EXPERIMENTS"
+            env = {"CROCOEXP_REPO_ROOT": str(repo)}
+            self.make_exp(root, name="EXP_A", data=True)
+            self.install_source(tmp, root, source_id="croco-unimport", env=env)
+            imported = self.run_cli(["--experiments-root", str(root), "import", "EXP_A", "--source", "croco-unimport"], env=env)
+            self.assertEqual(imported.returncode, 0, imported.stderr)
+            manifest_path = root / "EXP_A" / "metadata" / "manifest.json"
+            self.assertTrue(manifest_path.is_file())
+            before_input = self.input_hashes(root, name="EXP_A")
+            listed_before = self.run_cli(["--experiments-root", str(root), "experiment", "list", "--json"], env=env)
+            self.assertIn("EXP_A", listed_before.stdout)
+
+            result = self.run_cli(["--experiments-root", str(root), "experiment", "unimport", "EXP_A"], env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("Unimported experiment: EXP_A", result.stdout)
+            self.assertIn("Preserved user input: CROCO_EXPERIMENTS/EXP_A/input", result.stdout)
+            self.assertFalse(manifest_path.exists())
+            self.assertTrue((root / "EXP_A").is_dir())
+            self.assertTrue((root / "EXP_A" / "input" / "forcing.nc").is_file())
+            self.assertEqual(before_input, self.input_hashes(root, name="EXP_A"))
+            listed_after = self.run_cli(["--experiments-root", str(root), "experiment", "list", "--json"], env=env)
+            self.assertEqual(json.loads(listed_after.stdout)["experiments"], [])
+
+    def test_experiment_unimport_unknown_experiment_fails_without_modifying_repo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            root = repo / "CROCO_EXPERIMENTS"
+            env = {"CROCOEXP_REPO_ROOT": str(repo)}
+            root.mkdir(parents=True)
+            result = self.run_cli(["--experiments-root", str(root), "experiment", "unimport", "Missing"], env=env)
+            self.assertEqual(result.returncode, 3)
+            self.assertIn("experiment not found: Missing", result.stderr)
+            self.assertIn("crocoexp experiment list", result.stderr)
+            self.assertEqual(list(root.iterdir()), [])
+
+    def test_experiment_unimport_folder_without_manifest_fails_without_deleting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            root = repo / "CROCO_EXPERIMENTS"
+            env = {"CROCOEXP_REPO_ROOT": str(repo)}
+            exp = self.make_exp(root, name="NoManifest", data=True)
+            result = self.run_cli(["--experiments-root", str(root), "experiment", "unimport", "NoManifest"], env=env)
+            self.assertEqual(result.returncode, 5)
+            self.assertIn("exists but is not an imported experiment", result.stderr)
+            self.assertTrue(exp.is_dir())
+            self.assertTrue((exp / "input" / "forcing.nc").is_file())
+
+    def test_experiment_unimport_from_deep_subdirectory_uses_repo_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            root = repo / "CROCO_EXPERIMENTS"
+            env = {"CROCOEXP_REPO_ROOT": str(repo)}
+            self.make_exp(root, name="DeepUnimport", data=True)
+            self.install_source(tmp, root, source_id="croco-deep-unimport", env=env)
+            imported = self.run_cli(["--experiments-root", str(root), "import", "DeepUnimport", "--source", "croco-deep-unimport"], env=env)
+            self.assertEqual(imported.returncode, 0, imported.stderr)
+            deep = root / "DeepUnimport" / "input" / "nested"
+            deep.mkdir(parents=True)
+            result = self.run_cli(["experiment", "unimport", "DeepUnimport"], cwd=deep, env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse((root / "DeepUnimport" / "metadata" / "manifest.json").exists())
+            self.assertTrue((root / "DeepUnimport" / "input").is_dir())
+
+    def test_experiment_unimport_rejects_path_like_names_and_absolute_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            root = repo / "CROCO_EXPERIMENTS"
+            env = {"CROCOEXP_REPO_ROOT": str(repo)}
+            root.mkdir(parents=True)
+            for name in ("../EXP_A", "bad/name", "bad\\name", str(Path(tmp) / "external")):
+                with self.subTest(name=name):
+                    result = self.run_cli(["--experiments-root", str(root), "experiment", "unimport", name], env=env)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn("invalid experiment name", result.stderr)
+
+    def test_experiment_unimport_does_not_follow_or_remove_external_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            root = repo / "CROCO_EXPERIMENTS"
+            env = {"CROCOEXP_REPO_ROOT": str(repo)}
+            self.make_exp(root, name="SymlinkSafe", data=True)
+            self.install_source(tmp, root, source_id="croco-symlink-unimport", env=env)
+            imported = self.run_cli(["--experiments-root", str(root), "import", "SymlinkSafe", "--source", "croco-symlink-unimport"], env=env)
+            self.assertEqual(imported.returncode, 0, imported.stderr)
+            external = Path(tmp) / "external-build"
+            external.mkdir()
+            (external / "keep.txt").write_text("keep\n", encoding="utf-8")
+            build_link = root / "SymlinkSafe" / "build"
+            if build_link.exists():
+                shutil.rmtree(build_link)
+            build_link.symlink_to(external, target_is_directory=True)
+
+            result = self.run_cli(["--experiments-root", str(root), "experiment", "unimport", "SymlinkSafe"], env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(build_link.is_symlink())
+            self.assertTrue((external / "keep.txt").is_file())
+            self.assertFalse((root / "SymlinkSafe" / "metadata" / "manifest.json").exists())
 
     def test_inspect_after_import_reports_manifest_summary(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -627,8 +1282,9 @@ exit 1
 
     def test_inspect_does_not_modify_source_registry(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "CROCO_EXPERIMENTS"
-            env = {"CROCOEXP_REPO_ROOT": str(Path(tmp) / "repo")}
+            repo = Path(tmp) / "repo"
+            root = repo / "CROCO_EXPERIMENTS"
+            env = {"CROCOEXP_REPO_ROOT": str(repo)}
             self.make_exp(root, data=True)
             self.install_source(tmp, root, source_id="inspect-source", env=env)
             self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A", "--source", "inspect-source"], env=env).returncode, 0)
@@ -637,7 +1293,7 @@ exit 1
             result = self.run_cli(["--experiments-root", str(root), "inspect", "EXP_A"], env=env)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("Selected source ID: inspect-source", result.stdout)
-            self.assertIn(str(root / "sources" / "inspect-source"), result.stdout)
+            self.assertIn("CROCO_EXPERIMENTS/sources/inspect-source", result.stdout)
             self.assertEqual(registry_path.read_bytes(), before)
 
     def test_inspect_reports_ignored_run_env(self):
@@ -707,6 +1363,10 @@ exit 1
             root = Path(tmp) / "CROCO_EXPERIMENTS"
             self.make_exp(root, data=True)
             self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A"]).returncode, 0)
+            manifest_path = root / "EXP_A" / "metadata" / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["compile_time"]["source_ref"] = None
+            manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
             result = self.run_cli(["--experiments-root", str(root), "compile", "EXP_A", "--image", "fake/image"])
             self.assertEqual(result.returncode, 5)
             self.assertIn("missing compile source", result.stderr)
@@ -752,11 +1412,11 @@ exit 1
             self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A", "--source", "compile-ok"], env=env).returncode, 0)
             input_dir = root / "EXP_A" / "input"
             before = {p.relative_to(input_dir): p.read_bytes() for p in sorted(input_dir.rglob("*")) if p.is_file()}
-            result = self.run_cli(["--experiments-root", str(root), "compile", "EXP_A", "--json"], env=env)
+            result = self.run_cli(["--experiments-root", str(root), "compile", "EXP_A", "--no-clean", "--json"], env=env)
             self.assertEqual(result.returncode, 0, result.stderr)
             summary = json.loads(result.stdout)
             self.assertEqual(summary["source_id"], "compile-ok")
-            self.assertEqual(summary["docker_image"], "domarcroco/images-for-croco:base_croco_msot-1.0.0")
+            self.assertEqual(summary["docker_image"], "domarcroco/images-for-croco:base_croco-1.0.1")
             after = {p.relative_to(input_dir): p.read_bytes() for p in sorted(input_dir.rglob("*")) if p.is_file()}
             self.assertEqual(after, before)
             exp = root / "EXP_A"
@@ -769,7 +1429,7 @@ exit 1
             attempt = json.loads((exp / "metadata" / "compile_attempt.json").read_text(encoding="utf-8"))
             self.assertEqual(attempt["status"], "success")
             self.assertEqual(attempt["source_id"], "compile-ok")
-            self.assertEqual(attempt["docker_image"], "domarcroco/images-for-croco:base_croco_msot-1.0.0")
+            self.assertEqual(attempt["docker_image"], "domarcroco/images-for-croco:base_croco-1.0.1")
             self.assertTrue(attempt["docker_command"])
             self.assertEqual(attempt["binary"]["path"], str(exp / "build" / "stage" / "croco"))
             manifest = json.loads((exp / "metadata" / "manifest.json").read_text(encoding="utf-8"))
@@ -777,6 +1437,152 @@ exit 1
             report = (exp / "metadata" / "compile_report.md").read_text(encoding="utf-8")
             self.assertIn("Compile records a build attempt", report)
             self.assertIn("does not prove scientific correctness", report)
+
+    def test_compile_previous_artifacts_without_policy_noninteractive_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "CROCO_EXPERIMENTS"
+            env = self.fake_docker_env(tmp, present=True)
+            env["FAKE_DOCKER_RUN_CODE"] = "0"
+            self.make_exp(root, data=True)
+            self.install_source(tmp, root, source_id="compile-policy", env=env)
+            self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A", "--source", "compile-policy"], env=env).returncode, 0)
+            sentinel = root / "EXP_A" / "build" / "stage" / "old.o"
+            sentinel.parent.mkdir(parents=True, exist_ok=True)
+            sentinel.write_text("old\n", encoding="utf-8")
+
+            result = self.run_cli(["--experiments-root", str(root), "compile", "EXP_A"], env=env)
+            self.assertEqual(result.returncode, 5)
+            self.assertIn("previous compile artifacts detected", result.stderr)
+            self.assertIn("crocoexp compile EXP_A --clean", result.stderr)
+            self.assertTrue(sentinel.is_file())
+            self.assertFalse((root / "EXP_A" / "metadata" / "compile_attempt.json").exists())
+
+    def test_compile_clean_removes_previous_build_artifacts_safely(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "CROCO_EXPERIMENTS"
+            env = self.fake_docker_env(tmp, present=True)
+            env["FAKE_DOCKER_RUN_CODE"] = "0"
+            env["FAKE_DOCKER_WORK_OUTPUT"] = "croco"
+            self.make_exp(root, data=True)
+            self.install_source(tmp, root, source_id="compile-clean", env=env)
+            self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A", "--source", "compile-clean"], env=env).returncode, 0)
+            exp = root / "EXP_A"
+            old_object = exp / "build" / "stage" / "old.o"
+            old_module = exp / "build" / "old.mod"
+            old_object.parent.mkdir(parents=True, exist_ok=True)
+            old_object.write_text("old\n", encoding="utf-8")
+            old_module.write_text("old\n", encoding="utf-8")
+            old_attempt = exp / "metadata" / "compile_attempt.json"
+            old_attempt.write_text("{}\n", encoding="utf-8")
+            external = Path(tmp) / "external-build-target"
+            external.mkdir()
+            (external / "keep.txt").write_text("keep\n", encoding="utf-8")
+            link = exp / "build" / "external-link"
+            link.symlink_to(external, target_is_directory=True)
+            source_tree = root / "sources" / "compile-clean"
+            input_before = self.input_hashes(root)
+
+            result = self.run_cli(["--experiments-root", str(root), "compile", "EXP_A", "--clean", "--json"], env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            summary = json.loads(result.stdout)
+            self.assertEqual(summary["clean_policy"], "clean")
+            self.assertFalse(old_object.exists())
+            self.assertFalse(old_module.exists())
+            self.assertFalse(link.exists())
+            self.assertTrue((external / "keep.txt").is_file())
+            self.assertEqual(input_before, self.input_hashes(root))
+            self.assertTrue((exp / "metadata" / "manifest.json").is_file())
+            self.assertTrue(source_tree.is_dir())
+            attempt = json.loads((exp / "metadata" / "compile_attempt.json").read_text(encoding="utf-8"))
+            self.assertEqual(attempt["clean_policy"], "clean")
+            self.assertTrue(any("old.mod" in item for item in attempt["cleaned_artifacts"]))
+
+    def test_compile_no_clean_keeps_previous_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "CROCO_EXPERIMENTS"
+            env = self.fake_docker_env(tmp, present=True)
+            env["FAKE_DOCKER_RUN_CODE"] = "0"
+            self.make_exp(root, data=True)
+            self.install_source(tmp, root, source_id="compile-keep", env=env)
+            self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A", "--source", "compile-keep"], env=env).returncode, 0)
+            sentinel = root / "EXP_A" / "build" / "stage" / "keep.o"
+            sentinel.parent.mkdir(parents=True, exist_ok=True)
+            sentinel.write_text("keep\n", encoding="utf-8")
+
+            result = self.run_cli(["--experiments-root", str(root), "compile", "EXP_A", "--no-clean", "--json"], env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(sentinel.is_file())
+            summary = json.loads(result.stdout)
+            self.assertEqual(summary["clean_policy"], "no-clean")
+            attempt = json.loads((root / "EXP_A" / "metadata" / "compile_attempt.json").read_text(encoding="utf-8"))
+            self.assertEqual(attempt["clean_policy"], "no-clean")
+
+    def test_compile_previous_artifacts_tty_abort_clean_and_keep(self):
+        for choice, expected_policy in (("a\n", None), ("c\n", "clean"), ("k\n", "no-clean")):
+            with self.subTest(choice=choice.strip() or "enter"):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp) / "CROCO_EXPERIMENTS"
+                    env = self.fake_docker_env(tmp, present=True)
+                    env["FAKE_DOCKER_RUN_CODE"] = "0"
+                    self.make_exp(root, data=True)
+                    self.install_source(tmp, root, source_id="compile-tty", env=env)
+                    self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A", "--source", "compile-tty"], env=env).returncode, 0)
+                    sentinel = root / "EXP_A" / "build" / "stage" / "tty.o"
+                    sentinel.parent.mkdir(parents=True, exist_ok=True)
+                    sentinel.write_text("tty\n", encoding="utf-8")
+
+                    result = self.run_cli_pty(["--experiments-root", str(root), "compile", "EXP_A"], env=env, input_text=choice)
+                    self.assertIn("Previous compile artifacts detected", result.stdout)
+                    if expected_policy is None:
+                        self.assertEqual(result.returncode, 5)
+                        self.assertTrue(sentinel.is_file())
+                        self.assertFalse((root / "EXP_A" / "metadata" / "compile_attempt.json").exists())
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stdout)
+                        attempt = json.loads((root / "EXP_A" / "metadata" / "compile_attempt.json").read_text(encoding="utf-8"))
+                        self.assertEqual(attempt["clean_policy"], expected_policy)
+                        self.assertEqual(sentinel.exists(), expected_policy == "no-clean")
+
+    def test_compile_clean_no_clean_are_mutually_exclusive(self):
+        result = self.run_cli(["compile", "EXP_A", "--clean", "--no-clean"])
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("not allowed with argument", result.stderr)
+
+    def test_compile_orphaned_source_reference_fails_clearly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            root = repo / "CROCO_EXPERIMENTS"
+            env = {"CROCOEXP_REPO_ROOT": str(repo)}
+            self.make_exp(root, data=True)
+            self.install_source(tmp, root, source_id="compile-orphan", env=env)
+            self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A", "--source", "compile-orphan"], env=env).returncode, 0)
+            uninstall = self.run_cli(["--experiments-root", str(root), "source", "uninstall", "compile-orphan", "--force"], env=env)
+            self.assertEqual(uninstall.returncode, 0, uninstall.stderr)
+            result = self.run_cli(["--experiments-root", str(root), "compile", "EXP_A"], env=env)
+            self.assertEqual(result.returncode, 5)
+            self.assertIn("orphaned compile source reference: compile-orphan", result.stderr)
+            self.assertIn("crocoexp source list", result.stderr)
+
+    def test_compile_clean_from_deep_subdirectory_uses_repo_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            root = repo / "CROCO_EXPERIMENTS"
+            env = self.fake_docker_env(tmp, present=True)
+            env["CROCOEXP_REPO_ROOT"] = str(repo)
+            env["FAKE_DOCKER_RUN_CODE"] = "0"
+            self.make_exp(root, data=True)
+            self.install_source(tmp, root, source_id="compile-deep", env=env)
+            self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A", "--source", "compile-deep"], env=env).returncode, 0)
+            sentinel = root / "EXP_A" / "build" / "stage" / "deep.o"
+            sentinel.parent.mkdir(parents=True, exist_ok=True)
+            sentinel.write_text("deep\n", encoding="utf-8")
+            deep = root / "EXP_A" / "input" / "nested"
+            deep.mkdir(parents=True)
+
+            result = self.run_cli(["compile", "EXP_A", "--clean"], cwd=deep, env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(sentinel.exists())
+            self.assertTrue((root / "EXP_A" / "input" / "forcing.nc").is_file())
 
     def test_compile_uses_configured_image_and_falls_back_without_setup(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -786,12 +1592,12 @@ exit 1
             self.make_exp(root, data=True)
             self.install_source(tmp, root, source_id="image-source", env=env)
             self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A", "--source", "image-source"], env=env).returncode, 0)
-            result = self.run_cli(["--experiments-root", str(root), "compile", "EXP_A", "--json"], env=env)
+            result = self.run_cli(["--experiments-root", str(root), "compile", "EXP_A", "--no-clean", "--json"], env=env)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(json.loads(result.stdout)["docker_image"], "domarcroco/images-for-croco:base_croco_msot-1.0.0")
+            self.assertEqual(json.loads(result.stdout)["docker_image"], "domarcroco/images-for-croco:base_croco-1.0.1")
             repo = Path(env["CROCOEXP_REPO_ROOT"])
             (repo / ".crocoexp" / "config.json").write_text(json.dumps({"default_docker_image": "configured/image:tag"}) + "\n", encoding="utf-8")
-            result = self.run_cli(["--experiments-root", str(root), "compile", "EXP_A", "--json"], env=env)
+            result = self.run_cli(["--experiments-root", str(root), "compile", "EXP_A", "--no-clean", "--json"], env=env)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads(result.stdout)["docker_image"], "configured/image:tag")
 
@@ -807,8 +1613,9 @@ exit 1
             self.assertIn("malformed manifest JSON", malformed.stderr)
 
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "CROCO_EXPERIMENTS"
-            env = {"CROCOEXP_REPO_ROOT": str(Path(tmp) / "repo")}
+            repo = Path(tmp) / "repo"
+            root = repo / "CROCO_EXPERIMENTS"
+            env = {"CROCOEXP_REPO_ROOT": str(repo)}
             self.make_exp(root, data=True)
             self.install_source(tmp, root, source_id="deleted-registry", env=env)
             self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A", "--source", "deleted-registry"], env=env).returncode, 0)
@@ -818,8 +1625,9 @@ exit 1
             self.assertIn("deleted-registry", missing_registry.stderr)
 
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "CROCO_EXPERIMENTS"
-            env = {"CROCOEXP_REPO_ROOT": str(Path(tmp) / "repo")}
+            repo = Path(tmp) / "repo"
+            root = repo / "CROCO_EXPERIMENTS"
+            env = {"CROCOEXP_REPO_ROOT": str(repo)}
             self.make_exp(root, data=True)
             self.install_source(tmp, root, source_id="missing-tree", env=env)
             self.assertEqual(self.run_cli(["--experiments-root", str(root), "import", "EXP_A", "--source", "missing-tree"], env=env).returncode, 0)
@@ -853,8 +1661,9 @@ exit 1
 
     def test_compile_missing_entrypoint_invalid_names_and_missing_docker(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "CROCO_EXPERIMENTS"
-            env = {"CROCOEXP_REPO_ROOT": str(Path(tmp) / "repo")}
+            repo = Path(tmp) / "repo"
+            root = repo / "CROCO_EXPERIMENTS"
+            env = {"CROCOEXP_REPO_ROOT": str(repo)}
             self.make_exp(root, data=True)
             source = Path(tmp) / "source-without-entrypoint"
             source.mkdir()
@@ -894,6 +1703,10 @@ exit 1
             "source install",
             "source list",
             "source inspect",
+            "source uninstall",
+            "experiment",
+            "experiment list",
+            "experiment unimport",
             "import",
             "inspect",
             "compile",
@@ -919,9 +1732,13 @@ exit 1
             (["source", "install", "--help"], ["repo-level source registry", "does not modify experiments or input/"]),
             (["source", "list", "--help"], ["repo-level registered compile source trees"]),
             (["source", "inspect", "--help"], ["without invoking Docker or modifying experiments"]),
-            (["import", "--help"], ["input/", "metadata outside input/", "per-experiment source_ref"]),
+            (["source", "uninstall", "--help"], ["registered CROCO source", "Experiments that reference it are not modified"]),
+            (["experiment", "--help"], ["repo-level experiment manifests", "list", "unimport"]),
+            (["experiment", "list", "--help"], ["canonical manifest metadata", "source availability"]),
+            (["experiment", "unimport", "--help"], ["preserving input/", "CROCOEXP-managed metadata"]),
+            (["import", "--help"], ["input/", "metadata outside input/", "requires a registered CROCO source"]),
             (["inspect", "--help"], ["read-only summary", "does not create, rewrite, compile, dry-run, run, or modify input/"]),
-            (["compile", "--help"], ["Docker-backed build attempt", "compile_time.source_ref", "outside input/"]),
+            (["compile", "--help"], ["Docker-backed build attempt", "compile_time.source_ref", "outside input/", "--clean", "--no-clean"]),
             (["dry-run", "--help"], ["does not invoke Docker", "does not", "launch CROCO", "source run.env"]),
             (["run", "--help"], ["Consume metadata/dry_run_plan.json", "relative symlinks to input/", "serial/OpenMP"]),
         ]
@@ -988,7 +1805,7 @@ exit 1
             result = self.run_cli(["setup", "--json"], env=env)
             self.assertEqual(result.returncode, 0, result.stderr)
             summary = json.loads(result.stdout)
-            self.assertEqual(summary["default_docker_image"], "domarcroco/images-for-croco:base_croco_msot-1.0.0")
+            self.assertEqual(summary["default_docker_image"], "domarcroco/images-for-croco:base_croco-1.0.1")
 
     def test_setup_does_not_touch_experiment_input_or_source_state(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1394,7 +2211,10 @@ exit 1
             self.assertEqual(dry.returncode, 0, dry.stderr)
             plan_path = root / "EXP_A" / "metadata" / "dry_run_plan.json"
             plan = json.loads(plan_path.read_text(encoding="utf-8"))
-            Path(plan["binary_path"]).unlink()
+            binary_path = Path(plan["binary_path"])
+            if not binary_path.is_absolute():
+                binary_path = Path(tmp) / binary_path
+            binary_path.unlink()
             result = self.run_cli(["--experiments-root", str(root), "run", "EXP_A", "--run-id", "RUNBIN"])
             self.assertEqual(result.returncode, 10)
             self.assertIn("binary", result.stderr)
@@ -1589,7 +2409,7 @@ exit 1
                     str(root),
                     "setup",
                     "--image",
-                    "domarcroco/images-for-croco:base_croco_msot-1.0.0",
+                    "domarcroco/images-for-croco:base_croco-1.0.1",
                     "--pull",
                 ],
                 env=env,
@@ -1600,11 +2420,11 @@ exit 1
             self.assertTrue((repo / ".crocoexp" / "setup_report.md").is_file())
             self.assertFalse((repo / ".crocoexp" / "sources.json").exists())
 
-            self.install_source(tmp, root, source_id="croco-msot-local", env=env)
+            self.install_source(tmp, root, source_id="croco-local", env=env)
             self.assertTrue((repo / ".crocoexp" / "sources.json").is_file())
-            self.assertTrue((root / "sources" / "croco-msot-local").is_dir())
+            self.assertTrue((root / "sources" / "croco-local").is_dir())
 
-            imported = self.run_cli(["--experiments-root", str(root), "import", "minimal", "--source", "croco-msot-local"], env=env)
+            imported = self.run_cli(["--experiments-root", str(root), "import", "minimal", "--source", "croco-local"], env=env)
             self.assertEqual(imported.returncode, 0, imported.stderr)
             inspected = self.run_cli(["--experiments-root", str(root), "inspect", "minimal"], env=env)
             self.assertEqual(inspected.returncode, 0, inspected.stderr)
@@ -1620,7 +2440,7 @@ exit 1
 
             exp = root / "minimal"
             expected = [
-                root / "sources" / "croco-msot-local",
+                root / "sources" / "croco-local",
                 exp / "input",
                 exp / "metadata" / "manifest.json",
                 exp / "metadata" / "report.md",
@@ -1638,10 +2458,10 @@ exit 1
             for path in expected:
                 self.assertTrue(path.exists(), str(path))
             manifest = json.loads((exp / "metadata" / "manifest.json").read_text(encoding="utf-8"))
-            self.assertEqual(manifest["compile_time"]["source_ref"]["source_id"], "croco-msot-local")
-            self.assertEqual(manifest["compile"]["last_attempt"]["source_id"], "croco-msot-local")
+            self.assertEqual(manifest["compile_time"]["source_ref"]["source_id"], "croco-local")
+            self.assertEqual(manifest["compile"]["last_attempt"]["source_id"], "croco-local")
             self.assertEqual(manifest["runs"]["last_run_id"], "test-run-001")
-            self.assertFalse((exp / "input" / "croco-msot-local").exists())
+            self.assertFalse((exp / "input" / "croco-local").exists())
 
     def test_acceptance_input_immutable_across_import_inspect_compile_dry_run_run(self):
         with tempfile.TemporaryDirectory() as tmp:
