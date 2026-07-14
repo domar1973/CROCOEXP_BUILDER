@@ -1,7 +1,9 @@
 import hashlib
+import errno
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -14,6 +16,11 @@ SCHEMA_VERSION = "0.1"
 SOURCE_REGISTRY_SCHEMA_VERSION = 1
 CONTAINER_ROOT = "/opt/CROCO_EXPERIMENTS"
 DEFAULT_DOCKER_IMAGE = "domarcroco/images-for-croco:base_croco-1.0.1"
+DEFAULT_CONTAINER_PROFILE = "croco-1.0.1"
+DEFAULT_CONTAINER_INIT = (
+    "export LD_LIBRARY_PATH=/opt/intel/netcdf/lib/:/opt/intel/netcdff/lib/:"
+    "/opt/intel/oneapi/compiler/2023.0.0/linux/compiler/lib/intel64_lin/:$LD_LIBRARY_PATH"
+)
 DOCKER_NETCDFLIB = "-L/opt/intel/netcdf/lib -L/opt/intel/netcdff/lib  -lnetcdff -lnetcdf"
 DOCKER_NETCDFINC = "-I/opt/intel/netcdf/include -I/opt/intel/netcdff/include"
 DOCKER_NETCDF_LD_LIBRARY_PATH = "/opt/intel/netcdf/lib:/opt/intel/netcdff/lib"
@@ -60,6 +67,22 @@ class RepoContext:
         if self.relpath(resolved) is None:
             raise_external_path_error(resolved, field, command)
         return resolved
+
+
+@dataclass(frozen=True)
+class ContainerProfile:
+    name: str
+    image: str
+    init_commands: tuple[str, ...] = ()
+
+
+CONTAINER_PROFILES = {
+    DEFAULT_CONTAINER_PROFILE: ContainerProfile(
+        name=DEFAULT_CONTAINER_PROFILE,
+        image=DEFAULT_DOCKER_IMAGE,
+        init_commands=(DEFAULT_CONTAINER_INIT,),
+    )
+}
 
 
 _ACTIVE_REPO_CONTEXT = None
@@ -1309,6 +1332,45 @@ def configured_default_image():
     return DEFAULT_DOCKER_IMAGE
 
 
+def resolve_container_profile(manifest=None, requested_image=None, profile_name=None):
+    manifest = manifest or {}
+    declared = manifest.get("container_profile")
+    selected_name = profile_name or declared or DEFAULT_CONTAINER_PROFILE
+    if selected_name not in CONTAINER_PROFILES:
+        raise CrocoexpError(f"unknown container profile: {selected_name}", 5, "container_profile_not_found")
+    profile = CONTAINER_PROFILES[selected_name]
+    declared_image = manifest.get("container_image")
+    image = requested_image or declared_image
+    if image is None and selected_name == DEFAULT_CONTAINER_PROFILE:
+        image = configured_default_image()
+    if image is None:
+        image = profile.image
+    return ContainerProfile(profile.name, image, profile.init_commands)
+
+
+def host_uid_gid():
+    getuid = getattr(os, "getuid", None)
+    getgid = getattr(os, "getgid", None)
+    if not callable(getuid) or not callable(getgid):
+        return None
+    return getuid(), getgid()
+
+
+def build_container_command(profile, mounts, workdir, command, environment=None, host_user=True):
+    docker_cmd = ["docker", "run", "--rm"]
+    if host_user and (ids := host_uid_gid()) is not None:
+        docker_cmd.extend(["--user", f"{ids[0]}:{ids[1]}"])
+    for host_path, container_target, mode in mounts:
+        docker_cmd.extend(["-v", f"{host_path}:{container_target}:{mode}"])
+    if workdir:
+        docker_cmd.extend(["-w", str(workdir)])
+    for key, value in sorted((environment or {}).items()):
+        docker_cmd.extend(["-e", f"{key}={value}"])
+    effective = [*profile.init_commands, shlex.join([str(part) for part in command])]
+    docker_cmd.extend([profile.image, "bash", "-lc", " && ".join(effective)])
+    return docker_cmd
+
+
 def load_source_registry():
     path = setup_paths()["sources"]
     if not path.exists():
@@ -2434,15 +2496,45 @@ def remove_compile_artifact(path, paths):
     return True
 
 
-def clean_previous_compile_artifacts(paths, artifacts):
+def docker_clean_build_artifacts(paths, profile):
+    build = paths["build"]
+    ensure_safe_build_path(build, paths)
+    if build.is_symlink() or build.resolve(strict=False) != (paths["experiment_root"] / "build").resolve(strict=False):
+        raise CrocoexpError("refusing Docker cleanup outside the experiment build directory", 4, "metadata_or_staging")
+    command = build_container_command(
+        profile,
+        [(str(build), "/crocoexp-build", "rw")],
+        "/crocoexp-build",
+        ["find", ".", "-mindepth", "1", "-delete"],
+        host_user=False,
+    )
+    proc = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "unknown Docker cleanup error").strip()
+        raise CrocoexpError(f"Docker fallback could not clean build artifacts: {detail}", 7, "docker_backend")
+    return command
+
+
+def clean_previous_compile_artifacts(paths, artifacts, profile):
     removed = []
+    fallback_used = False
     for path in artifacts:
-        if remove_compile_artifact(path, paths):
-            removed.append(repo_rel(path))
+        try:
+            if remove_compile_artifact(path, paths):
+                removed.append(repo_rel(path))
+        except OSError as e:
+            if fallback_used or e.errno not in {errno.EACCES, errno.EPERM}:
+                raise
+            docker_clean_build_artifacts(paths, profile)
+            fallback_used = True
+            if not path.exists() and not path.is_symlink():
+                removed.append(repo_rel(path))
+            elif remove_compile_artifact(path, paths):
+                removed.append(repo_rel(path))
     if paths["build"].exists() and not paths["build"].is_symlink():
         paths["build"].mkdir(parents=True, exist_ok=True)
     paths["metadata"].mkdir(parents=True, exist_ok=True)
-    return removed
+    return removed, fallback_used
 
 
 def resolve_compile_source(args, manifest):
@@ -3530,6 +3622,7 @@ def cmd_run(args):
         run_dir = paths["runs"] / run_id
         materialization_plan, execution_plan, binary_path = resolve_run_plan(paths, dry_run_plan, run_id)
         docker_image = docker_image_for_run(dry_run_plan)
+        container_profile = resolve_container_profile(manifest, requested_image=docker_image)
         materialized = materialize_run_workdir_from_plan(paths, run_dir, materialization_plan, execution_plan, binary_path)
         snapshots = snapshot_run_inputs(paths, run_dir)
         stdout_path = run_dir / "logs" / "run_stdout.log"
@@ -3553,18 +3646,13 @@ def cmd_run(args):
             stderr_path.write_text("Run was not attempted because runtime materialization failed.\n", encoding="utf-8")
         else:
             run_script = write_run_wrapper(run_dir, execution_plan)
-            docker_cmd = [
-                "docker",
-                "run",
-                "--rm",
-                "-v",
-                f"{paths['experiments_root']}:{CONTAINER_ROOT}:rw",
-                "-w",
+            docker_cmd = build_container_command(
+                container_profile,
+                [(str(paths["experiments_root"]), CONTAINER_ROOT, "rw")],
                 container_path(run_dir / "work", paths["experiments_root"]),
-            ]
-            for key, value in sorted(execution_plan.get("environment", {}).items()):
-                docker_cmd.extend(["-e", f"{key}={value}"])
-            docker_cmd.extend([docker_image, "bash", container_path(run_script, paths["experiments_root"])])
+                ["bash", container_path(run_script, paths["experiments_root"])],
+                environment=execution_plan.get("environment", {}),
+            )
             docker_path = shutil.which("docker")
             if docker_path is None:
                 failure_category = "docker_backend"
@@ -3600,6 +3688,7 @@ def cmd_run(args):
             "failure_category": failure_category,
             "profile": execution_plan.get("profile"),
             "docker_image": docker_image,
+            "container_profile": container_profile.name,
             "docker_command": docker_cmd,
             "workdir": str(run_dir / "work"),
             "output_dir": str(run_dir / "output"),
@@ -3722,10 +3811,12 @@ def cmd_compile(args):
 
         source_ref = resolve_compile_source(args, manifest)
         manifest["compile_time"]["source_ref"] = source_ref
+        container_profile = resolve_container_profile(manifest, requested_image=args.image)
         clean_policy, previous_artifacts, previous_artifact_summary = resolve_compile_clean_policy(args, paths, manifest)
         cleaned_artifacts = []
+        clean_fallback_used = False
         if clean_policy == "clean":
-            cleaned_artifacts = clean_previous_compile_artifacts(paths, previous_artifacts)
+            cleaned_artifacts, clean_fallback_used = clean_previous_compile_artifacts(paths, previous_artifacts, container_profile)
             manifest.pop("compile", None)
             manifest.pop("build", None)
             if not args.json:
@@ -3760,7 +3851,7 @@ def cmd_compile(args):
         stdout_path = paths["build"] / "compile_stdout.log"
         stderr_path = paths["build"] / "compile_stderr.log"
         legacy_log_path = logs / f"compile_{args.experiment_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-        docker_image = args.image or configured_default_image()
+        docker_image = container_profile.image
         docker_mounts = [
             {
                 "host_path": str(paths["experiments_root"]),
@@ -3793,26 +3884,18 @@ def cmd_compile(args):
                 "purpose": "future_run_records",
             },
         ]
-        docker_cmd = [
-            "docker",
-            "run",
-            "--rm",
-            "-v",
-            f"{paths['experiments_root']}:{CONTAINER_ROOT}:ro",
-            "-v",
-            f"{paths['build']}:{container_path(paths['build'], paths['experiments_root'])}:rw",
-            "-v",
-            f"{paths['metadata']}:{container_path(paths['metadata'], paths['experiments_root'])}:rw",
-            "-v",
-            f"{paths['runs']}:{container_path(paths['runs'], paths['experiments_root'])}:rw",
-            "-w",
+        docker_cmd = build_container_command(
+            container_profile,
+            [
+                (str(paths["experiments_root"]), CONTAINER_ROOT, "ro"),
+                (str(paths["build"]), container_path(paths["build"], paths["experiments_root"]), "rw"),
+                (str(paths["metadata"]), container_path(paths["metadata"], paths["experiments_root"]), "rw"),
+                (str(paths["runs"]), container_path(paths["runs"], paths["experiments_root"]), "rw"),
+            ],
             f"{CONTAINER_ROOT}/{rel_to(stage, paths['experiments_root'])}",
-            "-e",
-            f"NPROCS={args.jobs}",
-            docker_image,
-            "bash",
-            str(Path(container_path(script, paths["experiments_root"]))),
-        ]
+            ["bash", container_path(script, paths["experiments_root"])],
+            environment={"NPROCS": args.jobs},
+        )
         findings = [
             "Compile is an attempted Docker-backed build; runtime semantic findings do not block it by default.",
             f"Registered compile source selected: {source_ref['source_id']}",
@@ -3824,6 +3907,7 @@ def cmd_compile(args):
         warnings = list(manifest.get("reporting", {}).get("warnings", []))
         manifest["compile_time"]["staged_inputs"] = staged
         manifest["docker_backend"]["image"] = docker_image
+        manifest["docker_backend"]["profile"] = container_profile.name
         manifest["docker_backend"]["working_directory"] = container_path(stage, paths["experiments_root"])
         manifest["docker_backend"]["compile_command_summary"] = " ".join(docker_cmd)
         manifest["docker_backend"]["mounts"] = docker_mounts
@@ -3887,6 +3971,7 @@ def cmd_compile(args):
             "clean_policy": clean_policy,
             "previous_compile_artifacts": previous_artifact_summary,
             "cleaned_artifacts": cleaned_artifacts,
+            "clean_fallback_used": clean_fallback_used,
         }
         write_compile_attempt(attempt_path, attempt)
         if binary:
