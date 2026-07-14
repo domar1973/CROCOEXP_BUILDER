@@ -7,13 +7,40 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+
+import crocoexp_lib as lib  # noqa: E402
+
+
 CLI = REPO_ROOT / "crocoexp"
 
 
 class CrocoexpTests(unittest.TestCase):
+    def test_default_container_profile_and_extensible_registry(self):
+        default = lib.CONTAINER_PROFILES[lib.DEFAULT_CONTAINER_PROFILE]
+        self.assertEqual(default.image, lib.DEFAULT_DOCKER_IMAGE)
+        self.assertIn("export LD_LIBRARY_PATH=/opt/intel/netcdf/lib/", default.init_commands[0])
+        self.assertEqual(lib.resolve_container_profile({}).name, lib.DEFAULT_CONTAINER_PROFILE)
+
+        alternate = lib.ContainerProfile("alternate", "example/croco:arm64", ("source /opt/croco/env.sh",))
+        with mock.patch.dict(lib.CONTAINER_PROFILES, {"alternate": alternate}):
+            resolved = lib.resolve_container_profile({"container_profile": "alternate"})
+        self.assertEqual(resolved, alternate)
+
+    def test_container_command_initializes_before_command_and_uses_host_identity(self):
+        profile = lib.CONTAINER_PROFILES[lib.DEFAULT_CONTAINER_PROFILE]
+        with mock.patch.object(lib, "host_uid_gid", return_value=(123, 456)):
+            command = lib.build_container_command(profile, [("/host", "/work", "rw")], "/work", ["./jobcomp", "two words"])
+        self.assertIn("--user", command)
+        self.assertIn("123:456", command)
+        effective = command[-1]
+        self.assertLess(effective.index("export LD_LIBRARY_PATH="), effective.index("./jobcomp"))
+        self.assertIn("'two words'", effective)
+
     def make_exp(self, root, name="EXP_A", analytical=False, data=False, croco_text=None):
         exp = root / name
         input_dir = exp / "input"
@@ -1431,6 +1458,9 @@ exit 1
             self.assertEqual(attempt["source_id"], "compile-ok")
             self.assertEqual(attempt["docker_image"], "domarcroco/images-for-croco:base_croco-1.0.1")
             self.assertTrue(attempt["docker_command"])
+            self.assertIn("--user", attempt["docker_command"])
+            self.assertIn("export LD_LIBRARY_PATH=", attempt["docker_command"][-1])
+            self.assertLess(attempt["docker_command"][-1].index("export LD_LIBRARY_PATH="), attempt["docker_command"][-1].index("compile_inside_docker.sh"))
             self.assertEqual(attempt["binary"]["path"], str(exp / "build" / "stage" / "croco"))
             manifest = json.loads((exp / "metadata" / "manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["compile"]["last_attempt"]["source_id"], "compile-ok")
@@ -1496,6 +1526,52 @@ exit 1
             attempt = json.loads((exp / "metadata" / "compile_attempt.json").read_text(encoding="utf-8"))
             self.assertEqual(attempt["clean_policy"], "clean")
             self.assertTrue(any("old.mod" in item for item in attempt["cleaned_artifacts"]))
+
+    def test_compile_clean_permission_error_uses_profiled_docker_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            exp = repo / "CROCO_EXPERIMENTS" / "EXP_A"
+            paths = {
+                "experiments_root": exp.parent,
+                "experiment_root": exp,
+                "input": exp / "input",
+                "metadata": exp / "metadata",
+                "manifest": exp / "metadata" / "manifest.json",
+                "build": exp / "build",
+            }
+            for key in ("input", "metadata", "build"):
+                paths[key].mkdir(parents=True, exist_ok=True)
+            artifact = paths["build"] / "root-owned.o"
+            artifact.write_text("old", encoding="utf-8")
+            profile = lib.CONTAINER_PROFILES[lib.DEFAULT_CONTAINER_PROFILE]
+            with (
+                mock.patch.object(lib, "remove_compile_artifact", side_effect=[PermissionError(13, "denied"), False]),
+                mock.patch.object(lib, "docker_clean_build_artifacts") as fallback,
+            ):
+                removed, used = lib.clean_previous_compile_artifacts(paths, [artifact], profile)
+            self.assertTrue(used)
+            fallback.assert_called_once_with(paths, profile)
+            self.assertEqual(removed, [])
+
+    def test_docker_clean_fallback_rejects_build_outside_experiment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            exp = root / "CROCO_EXPERIMENTS" / "EXP_A"
+            outside = root / "other-build"
+            outside.mkdir(parents=True)
+            paths = {
+                "experiments_root": exp.parent,
+                "experiment_root": exp,
+                "input": exp / "input",
+                "metadata": exp / "metadata",
+                "manifest": exp / "metadata" / "manifest.json",
+                "build": outside,
+            }
+            profile = lib.CONTAINER_PROFILES[lib.DEFAULT_CONTAINER_PROFILE]
+            with mock.patch.object(lib.subprocess, "run") as docker_run:
+                with self.assertRaises(lib.CrocoexpError):
+                    lib.docker_clean_build_artifacts(paths, profile)
+            docker_run.assert_not_called()
 
     def test_compile_no_clean_keeps_previous_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2286,6 +2362,9 @@ exit 1
             self.assertEqual(attempt_json["profile"], "serial")
             self.assertTrue(attempt_json["outputs"])
             self.assertIn("docker", attempt_json["docker_command"][0])
+            self.assertIn("--user", attempt_json["docker_command"])
+            self.assertIn("export LD_LIBRARY_PATH=", attempt_json["docker_command"][-1])
+            self.assertLess(attempt_json["docker_command"][-1].index("export LD_LIBRARY_PATH="), attempt_json["docker_command"][-1].index("run_inside_docker.sh"))
             report = (run_dir / "reports" / "run_report.md").read_text(encoding="utf-8")
             self.assertIn("Run success does not prove scientific correctness", report)
 

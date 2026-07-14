@@ -108,7 +108,7 @@ Compile through Docker from the host:
 ./crocoexp compile my_experiment
 ```
 
-`compile` uses the per-experiment source reference recorded during import. Docker is used only as the backend; build staging, logs, `metadata/compile_attempt.json`, and `metadata/compile_report.md` are written outside `input/`. If previous compile artifacts are detected, non-interactive use must choose `--clean` or `--no-clean`; interactive use asks before modifying build state. Compile does not run CROCO, and compile success does not prove scientific correctness or runtime semantic compatibility.
+`compile` uses the per-experiment source reference recorded during import. Docker is used only as the backend; build staging, logs, `metadata/compile_attempt.json`, and `metadata/compile_report.md` are written outside `input/`. Container commands use an internal image profile that initializes the image environment and run with the host UID:GID when available. Older experiments without a declared profile use the default profile automatically. If previous compile artifacts are detected, non-interactive use must choose `--clean` or `--no-clean`; interactive use asks before modifying build state. `--clean` is restricted to compile build artifacts and can use a controlled Docker fallback for artifacts left with incompatible permissions. Compile does not run CROCO, and compile success does not prove scientific correctness or runtime semantic compatibility.
 
 Generate a pre-execution report without running CROCO:
 
@@ -129,7 +129,7 @@ Attempt a CROCO run through Docker:
 ./crocoexp run my_experiment
 ```
 
-`run` consumes `metadata/dry_run_plan.json`, materializes a run-local workdir under `runs/<run_id>/work/`, exposes runtime data assets using relative symlinks back to `input/`, and launches CROCO through Docker as a backend. It does not compile CROCO. It records logs, snapshots, output inventory, `runs/<run_id>/reports/run_attempt.json`, and `runs/<run_id>/reports/run_report.md`.
+`run` consumes `metadata/dry_run_plan.json`, materializes a run-local workdir under `runs/<run_id>/work/`, exposes runtime data assets using relative symlinks back to `input/`, and launches CROCO through Docker as a backend. The effective container profile initializes image-specific environment variables, including the default image's NetCDF library path, before CROCO starts. It does not compile CROCO. It records logs, snapshots, output inventory, `runs/<run_id>/reports/run_attempt.json`, and `runs/<run_id>/reports/run_report.md`.
 
 Run success records an execution attempt only. It does not prove scientific correctness, runtime semantic compatibility, or experiment well-posedness. MPI, OPENACC, XIOS, OASIS, AGRIF, and other specialized execution profiles remain out of scope for v1.0.1 unless explicitly implemented and tested.
 

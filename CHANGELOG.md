@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.0.2] - Unreleased
+
+### Fixed
+
+- Docker-based `run` now initializes the default container environment before launching CROCO, including `LD_LIBRARY_PATH` for NetCDF dynamic libraries.
+- Docker-based `compile` and auxiliary container commands now use the same container profile initialization path.
+- Experiments imported before image profiles existed now fall back to the default container profile.
+- `compile --clean` now handles permission issues caused by previous Docker-created build artifacts.
+
+### Changed
+
+- Introduced internal container image profiles to centralize Docker image selection and image-specific initialization.
+
 ## v1.0.0
 
 Initial stable release of CROCOEXP Builder as a host-side, traceability-oriented CROCO experiment orchestrator.
